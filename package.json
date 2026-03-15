@@ -1,0 +1,16 @@
+{
+  "name": "bluecollar",
+  "version": "1.0.0",
+  "description": "BlueCollar - Decentralised protocol built on Stellar that connects local skilled workers with users through community-curated listings",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:api": "pnpm --filter @bluecollar/api dev",
+    "build:api": "pnpm --filter @bluecollar/api build",
+    "dev:app": "pnpm --filter @bluecollar/app dev",
+    "build:app": "pnpm --filter @bluecollar/app build"
+  },
+  "license": "MIT"
+}

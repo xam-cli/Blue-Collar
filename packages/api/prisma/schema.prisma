@@ -1,0 +1,64 @@
+// This is the BlueCollar Prisma schema
+// Built on Stellar — connecting skilled workers with users
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  password      String
+  firstName     String
+  lastName      String
+  role          Role      @default(user)
+  walletAddress String?
+  avatar        String?
+  bio           String?
+  phone         String?
+  verified      Boolean   @default(false)
+  locationId    String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  workers       Worker[]
+}
+
+model Category {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  icon        String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  workers     Worker[]
+}
+
+model Worker {
+  id            String   @id @default(cuid())
+  name          String
+  bio           String?
+  avatar        String?
+  phone         String?
+  email         String?
+  walletAddress String?
+  isActive      Boolean  @default(true)
+  isVerified    Boolean  @default(false)
+  categoryId    String
+  category      Category @relation(fields: [categoryId], references: [id])
+  curatorId     String
+  curator       User     @relation(fields: [curatorId], references: [id])
+  locationId    String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+enum Role {
+  user
+  curator
+  admin
+}
