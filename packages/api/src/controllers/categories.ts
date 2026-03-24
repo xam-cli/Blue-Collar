@@ -2,7 +2,7 @@ import type { Request, Response } from 'express'
 import { db } from '../db.js'
 
 export async function listCategories(_req: Request, res: Response) {
-  const categories = await db.category.findMany()
+  const categories = await db.category.findMany({ include: { _count: { select: { workers: true } } } })
   return res.json({ data: categories, status: 'success', code: 200 })
 }
 
