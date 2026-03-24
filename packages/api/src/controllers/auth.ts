@@ -2,6 +2,7 @@ import type { Request, Response } from 'express'
 import { db } from '../db.js'
 import argon2 from 'argon2'
 import jwt from 'jsonwebtoken'
+import { UserResource } from '../resources/index.js'
 
 export async function login(req: Request, res: Response) {
   const { email, password } = req.body
@@ -10,16 +11,14 @@ export async function login(req: Request, res: Response) {
     return res.status(401).json({ status: 'error', message: 'Invalid credentials', code: 401 })
   }
   const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET!, { expiresIn: '7d' })
-  const { password: _, ...data } = user
-  return res.status(202).json({ data, status: 'success', message: 'Login successful', code: 202, token })
+  return res.status(202).json({ data: UserResource(user), status: 'success', message: 'Login successful', code: 202, token })
 }
 
 export async function register(req: Request, res: Response) {
   const { email, password, firstName, lastName } = req.body
   const hashed = await argon2.hash(password)
   const user = await db.user.create({ data: { email, password: hashed, firstName, lastName } })
-  const { password: _, ...data } = user
-  return res.status(201).json({ data, status: 'success', message: 'Registration successful', code: 201 })
+  return res.status(201).json({ data: UserResource(user), status: 'success', message: 'Registration successful', code: 201 })
 }
 
 export async function logout(_req: Request, res: Response) {

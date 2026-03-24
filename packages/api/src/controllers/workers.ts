@@ -1,5 +1,6 @@
 import type { Request, Response } from 'express'
 import { db } from '../db.js'
+import { WorkerResource, WorkerCollection } from '../resources/index.js'
 
 export async function listWorkers(req: Request, res: Response) {
   const { category, location, page = '1', limit = '20' } = req.query
@@ -10,28 +11,35 @@ export async function listWorkers(req: Request, res: Response) {
     },
     skip: (Number(page) - 1) * Number(limit),
     take: Number(limit),
-    include: { category: true },
+    include: { category: true, curator: true },
   })
-  return res.json({ data: workers, status: 'success', code: 200 })
+  return res.json({ data: WorkerCollection(workers), status: 'success', code: 200 })
 }
 
 export async function showWorker(req: Request, res: Response) {
   const worker = await db.worker.findUnique({
     where: { id: req.params.id },
-    include: { category: true },
+    include: { category: true, curator: true },
   })
   if (!worker) return res.status(404).json({ status: 'error', message: 'Not found', code: 404 })
-  return res.json({ data: worker, status: 'success', code: 200 })
+  return res.json({ data: WorkerResource(worker), status: 'success', code: 200 })
 }
 
 export async function createWorker(req: Request, res: Response) {
-  const worker = await db.worker.create({ data: { ...req.body, curatorId: req.user!.id } })
-  return res.status(201).json({ data: worker, status: 'success', code: 201 })
+  const worker = await db.worker.create({ 
+    data: { ...req.body, curatorId: req.user!.id },
+    include: { category: true, curator: true }
+  })
+  return res.status(201).json({ data: WorkerResource(worker), status: 'success', code: 201 })
 }
 
 export async function updateWorker(req: Request, res: Response) {
-  const worker = await db.worker.update({ where: { id: req.params.id }, data: req.body })
-  return res.json({ data: worker, status: 'success', code: 200 })
+  const worker = await db.worker.update({ 
+    where: { id: req.params.id }, 
+    data: req.body,
+    include: { category: true, curator: true }
+  })
+  return res.json({ data: WorkerResource(worker), status: 'success', code: 200 })
 }
 
 export async function deleteWorker(req: Request, res: Response) {
@@ -45,6 +53,7 @@ export async function toggleActivation(req: Request, res: Response) {
   const updated = await db.worker.update({
     where: { id: req.params.id },
     data: { isActive: !worker.isActive },
+    include: { category: true, curator: true }
   })
-  return res.json({ data: updated, status: 'success', code: 200 })
+  return res.json({ data: WorkerResource(updated), status: 'success', code: 200 })
 }
