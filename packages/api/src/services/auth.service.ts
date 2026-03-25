@@ -19,6 +19,9 @@ function generateVerificationToken(userId: string) {
 export async function loginUser({ email, password }: LoginBody) {
   const user = await db.user.findUnique({ where: { email } })
   if (!user || !user.password || !(await argon2.verify(user.password, password))) {
+export async function loginUser(email: string, password: string) {
+  const user = await db.user.findUnique({ where: { email } })
+  if (!user || !(await argon2.verify(user.password, password))) {
     throw new AppError('Invalid credentials', 401)
   }
   if (!user.verified) {
@@ -32,6 +35,16 @@ export async function loginUser({ email, password }: LoginBody) {
 }
 
 export async function registerUser({ email, password, firstName, lastName }: RegisterBody) {
+  const { password: _, verificationToken: __, verificationTokenExpiry: ___, ...data } = user
+  return { data, token }
+}
+
+export async function registerUser(
+  email: string,
+  password: string,
+  firstName: string,
+  lastName: string,
+) {
   const existing = await db.user.findUnique({ where: { email } })
   if (existing) throw new AppError('Email already in use', 409)
 
@@ -53,6 +66,11 @@ export async function registerUser({ email, password, firstName, lastName }: Reg
 
 /** Returns true if newly verified, false if already verified. */
 export async function verifyAccount(token: string): Promise<boolean> {
+  const { password: _, verificationToken: __, verificationTokenExpiry: ___, ...data } = user
+  return data
+}
+
+export async function verifyAccount(token: string) {
   let payload: { id?: string; purpose?: string }
   try {
     payload = jwt.verify(token, process.env.JWT_SECRET!) as { id: string; purpose: string }
@@ -67,6 +85,7 @@ export async function verifyAccount(token: string): Promise<boolean> {
   const user = await db.user.findUnique({ where: { id: payload.id } })
   if (!user) throw new AppError('User not found', 404)
   if (user.verified) return false // already verified
+  if (user.verified) return // already verified — no-op
 
   const incomingHash = crypto.createHash('sha256').update(token).digest('hex')
   const valid =
