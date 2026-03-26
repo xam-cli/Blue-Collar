@@ -1,6 +1,7 @@
 // Entry point for BlueCollar API
 import express from 'express'
 import cors from 'cors'
+import helmet from 'helmet'
 import { corsConfig } from './config/cors.js'
 import { env } from './config/env.js'
 import pinoHttp from 'pino-http'
@@ -15,7 +16,20 @@ import adminRoutes from './routes/admin.js'
 const app = express()
 const PORT = env.PORT || 3000
 
-app.use(cors(corsConfig))
+// Apply Helmet for HTTP security headers
+// strict CSP since we only serve JSON, not HTML
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'none'"],
+      baseUri: ["'none'"],
+      formAction: ["'none'"],
+      frameAncestors: ["'none'"],
+    },
+  },
+}))
+
+app.use(cors())
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 app.use(pinoHttp({ logger }))
