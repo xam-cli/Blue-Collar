@@ -3,7 +3,7 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone)]
@@ -75,6 +75,42 @@ impl RegistryContract {
             .persistent()
             .get(&DataKey::WorkerList)
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Permanently remove a worker from the registry (owner only).
+    ///
+    /// Deletes the worker record from persistent storage and removes the id
+    /// from WorkerList.
+    ///
+    /// Emits: WrkDrg
+    pub fn deregister(env: Env, id: Symbol, caller: Address) {
+        caller.require_auth();
+
+        let worker: Worker = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Worker(id.clone()))
+            .expect("Worker not found");
+
+        assert!(worker.owner == caller, "Not authorized");
+
+        env.storage().persistent().remove(&DataKey::Worker(id.clone()));
+
+        let mut list: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WorkerList)
+            .unwrap_or(Vec::new(&env));
+        if let Some(pos) = list.iter().position(|x| x == id) {
+            list.remove(pos as u32);
+        }
+        env.storage().persistent().set(&DataKey::WorkerList, &list);
+
+        // topics: ("WrkDrg", id, caller)  data: ()
+        env.events().publish(
+            (symbol_short!("WrkDrg"), id, caller),
+            (),
+        );
     }
 
     /// Upgrade the contract WASM (admin only)

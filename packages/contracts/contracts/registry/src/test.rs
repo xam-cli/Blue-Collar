@@ -13,7 +13,7 @@ use soroban_sdk::{
 fn setup() -> (Env, Address) {
     let env = Env::default();
     env.mock_all_auths();
-    let contract = env.register(RegistryContract, ());
+    let contract = env.register_contract(None, RegistryContract);
     (env, contract)
 }
 
@@ -86,7 +86,7 @@ fn test_register_duplicate_id_overwrites() {
 fn test_register_unauthorized() {
     let env = Env::default();
     // Do NOT mock auths — require_auth will panic
-    let contract = env.register(RegistryContract, ());
+    let contract = env.register_contract(None, RegistryContract);
     let owner = Address::generate(&env);
     let client = RegistryContractClient::new(&env, &contract);
 
@@ -216,4 +216,83 @@ fn test_list_workers_after_toggle_still_listed() {
 
     let list = client.list_workers();
     assert_eq!(list.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// deregister
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_deregister_removes_worker_record() {
+    let (env, contract) = setup();
+    let owner = Address::generate(&env);
+    make_worker(&env, &contract, "w1", &owner);
+
+    let client = RegistryContractClient::new(&env, &contract);
+    client.deregister(&Symbol::new(&env, "w1"), &owner);
+
+    assert!(client.get_worker(&Symbol::new(&env, "w1")).is_none());
+}
+
+#[test]
+fn test_deregister_removes_from_list() {
+    let (env, contract) = setup();
+    let owner = Address::generate(&env);
+    make_worker(&env, &contract, "w1", &owner);
+    make_worker(&env, &contract, "w2", &owner);
+    make_worker(&env, &contract, "w3", &owner);
+
+    let client = RegistryContractClient::new(&env, &contract);
+    client.deregister(&Symbol::new(&env, "w2"), &owner);
+
+    let list = client.list_workers();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list.get(0).unwrap(), Symbol::new(&env, "w1"));
+    assert_eq!(list.get(1).unwrap(), Symbol::new(&env, "w3"));
+}
+
+#[test]
+fn test_deregister_last_worker_empties_list() {
+    let (env, contract) = setup();
+    let owner = Address::generate(&env);
+    make_worker(&env, &contract, "w1", &owner);
+
+    let client = RegistryContractClient::new(&env, &contract);
+    client.deregister(&Symbol::new(&env, "w1"), &owner);
+
+    assert_eq!(client.list_workers().len(), 0);
+}
+
+#[test]
+#[should_panic(expected = "Not authorized")]
+fn test_deregister_non_owner_panics() {
+    let (env, contract) = setup();
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    make_worker(&env, &contract, "w1", &owner);
+
+    let client = RegistryContractClient::new(&env, &contract);
+    client.deregister(&Symbol::new(&env, "w1"), &stranger);
+}
+
+#[test]
+#[should_panic(expected = "Worker not found")]
+fn test_deregister_nonexistent_worker_panics() {
+    let (env, contract) = setup();
+    let caller = Address::generate(&env);
+
+    let client = RegistryContractClient::new(&env, &contract);
+    client.deregister(&Symbol::new(&env, "ghost"), &caller);
+}
+
+#[test]
+#[should_panic(expected = "Worker not found")]
+fn test_deregister_twice_panics() {
+    let (env, contract) = setup();
+    let owner = Address::generate(&env);
+    make_worker(&env, &contract, "w1", &owner);
+
+    let client = RegistryContractClient::new(&env, &contract);
+    client.deregister(&Symbol::new(&env, "w1"), &owner);
+    client.deregister(&Symbol::new(&env, "w1"), &owner);
 }
