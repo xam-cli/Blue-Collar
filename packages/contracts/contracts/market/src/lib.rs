@@ -19,9 +19,66 @@ pub struct Escrow {
 }
 
 #[contracttype]
+#[derive(Clone)]
+pub struct Config {
+    pub admin: Address,
+    pub fee_bps: u32,
+    pub fee_recipient: Address,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Config {
+    pub admin: Address,
+    pub fee_bps: u32,
+    pub fee_recipient: Address,
+}
+
+#[contracttype]
 pub enum DataKey {
     Escrow(Symbol),
+    /// Instance storage — admin address, set once at initialize
+    Admin,
+    Tip(Symbol),
+    Admin,
+    FeeBps,
+    FeeRecipient,
+    Escrow(Symbol),
+    Config,
 }
+
+// ---------------------------------------------------------------------------
+// Escrow state
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, PartialEq)]
+pub enum EscrowStatus {
+    Active,
+    Released,
+    Cancelled,
+}
+
+// =============================================================================
+// Contract
+// =============================================================================
+#[contracttype]
+#[derive(Clone)]
+pub struct Escrow {
+    pub from: Address,
+    pub to: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub expiry: u64,
+    pub status: EscrowStatus,
+}
+
+// ---------------------------------------------------------------------------
+// Contract
+// ---------------------------------------------------------------------------
+
+/// Maximum fee: 5% = 500 bps
+pub const MAX_FEE_BPS: u32 = 500;
 
 #[contract]
 pub struct MarketContract;
@@ -34,28 +91,103 @@ impl MarketContract {
 
     /// Send a direct tip to a worker — transfers tokens immediately.
     /// Emits: TipSent
-    pub fn tip(env: Env, from: Address, to: Address, token_addr: Address, amount: i128) {
-        from.require_auth();
-        let client = token::Client::new(&env, &token_addr);
-        client.transfer(&from, &to, &amount);
-
-        // topics: ("TipSent", from, to)  data: (token_addr, amount)
-        env.events().publish(
-            (symbol_short!("TipSent"), from, to),
-            (token_addr, amount),
+    /// Initialise the contract — sets admin, fee basis points, and fee recipient
+    pub fn initialize(env: Env, admin: Address, fee_bps: u32, fee_recipient: Address) {
+        assert!(
+            !env.storage().instance().has(&DataKey::Admin),
+            "Already initialized"
         );
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
     }
 
-    // -------------------------------------------------------------------------
-    // Escrow lifecycle
-    // -------------------------------------------------------------------------
+    /// Return the admin address
+    pub fn get_admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Admin).expect("Not initialized")
+    }
 
-    /// Lock funds in escrow.
-    ///
-    /// `expiry` is a ledger timestamp (seconds since Unix epoch) after which
-    /// the payer is allowed to cancel and reclaim funds.
-    ///
-    /// Emits: EscrowCreated
+    /// Return the fee in basis points (e.g. 100 = 1%)
+    pub fn get_fee_bps(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::FeeBps).expect("Not initialized")
+    }
+
+    /// Return the address that receives collected fees
+    pub fn get_fee_recipient(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::FeeRecipient).expect("Not initialized")
+    }
+
+    /// Send a tip to a worker — transfers tokens directly
+    // -----------------------------------------------------------------------
+    // Initialise
+    // -----------------------------------------------------------------------
+
+    /// Initialise the contract with an admin, fee in basis points, and fee recipient.
+    /// Must be called once before any other function.
+    pub fn initialize(env: Env, admin: Address, fee_bps: u32, fee_recipient: Address) {
+        assert!(
+            !env.storage().instance().has(&DataKey::Config),
+            "Already initialized"
+        );
+        assert!(fee_bps <= MAX_FEE_BPS, "fee_bps exceeds maximum (500)");
+        let config = Config {
+            admin,
+            fee_bps,
+            fee_recipient,
+        };
+        env.storage().instance().set(&DataKey::Config, &config);
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin
+    // -----------------------------------------------------------------------
+
+    /// Update the protocol fee (admin only, capped at 500 bps / 5%).
+    pub fn update_fee(env: Env, admin: Address, new_fee_bps: u32) {
+        admin.require_auth();
+        assert!(new_fee_bps <= MAX_FEE_BPS, "fee_bps exceeds maximum (500)");
+        let mut config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .expect("Not initialized");
+        assert!(config.admin == admin, "Unauthorized");
+        config.fee_bps = new_fee_bps;
+        env.storage().instance().set(&DataKey::Config, &config);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tip
+    // -----------------------------------------------------------------------
+
+    /// Send a tip to a worker.
+    /// Deducts a protocol fee (fee_bps) and transfers the remainder to `to`.
+    pub fn tip(env: Env, from: Address, to: Address, token_addr: Address, amount: i128) {
+        from.require_auth();
+        assert!(amount > 0, "Amount must be positive");
+
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .expect("Not initialized");
+
+        let client = token::Client::new(&env, &token_addr);
+
+        let fee: i128 = (amount * config.fee_bps as i128) / 10_000;
+        let worker_amount = amount - fee;
+
+        client.transfer(&from, &to, &worker_amount);
+        if fee > 0 {
+            client.transfer(&from, &config.fee_recipient, &fee);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Escrow
+    // -----------------------------------------------------------------------
+
+    /// Create an escrow — locks tokens until released, cancelled, or expired.
     pub fn create_escrow(
         env: Env,
         id: Symbol,
@@ -67,6 +199,7 @@ impl MarketContract {
     ) {
         from.require_auth();
 
+        assert!(amount > 0, "Amount must be positive");
         assert!(
             !env.storage().persistent().has(&DataKey::Escrow(id.clone())),
             "Escrow id already exists"
@@ -100,6 +233,24 @@ impl MarketContract {
     /// Callable by either `from` (payer approves) or `to` (worker claims).
     ///
     /// Emits: EscrowReleased
+
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&from, &env.current_contract_address(), &amount);
+
+        let escrow = Escrow {
+            from,
+            to,
+            token: token_addr,
+            amount,
+            expiry,
+            status: EscrowStatus::Active,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(id), &escrow);
+    }
+
+    /// Release escrow funds to the worker (from only).
     pub fn release_escrow(env: Env, id: Symbol, caller: Address) {
         caller.require_auth();
         let mut escrow: Escrow = env
@@ -426,3 +577,5 @@ mod tests {
         assert!(t.client().get_escrow(&id).is_none());
     }
 }
+#[cfg(test)]
+mod test;
