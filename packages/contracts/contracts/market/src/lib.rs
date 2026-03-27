@@ -13,6 +13,10 @@ use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Add
 // Data types
 // =============================================================================
 
+// ---------------------------------------------------------------------------
+// Data types
+// ---------------------------------------------------------------------------
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Escrow {
@@ -35,10 +39,21 @@ pub struct Config {
 }
 
 #[contracttype]
+#[derive(Clone)]
+pub struct Config {
+    pub admin: Address,
+    pub fee_bps: u32,
+    pub fee_recipient: Address,
+}
+
+#[contracttype]
 pub enum DataKey {
     /// Instance storage — admin address, set once at initialize
     Admin,
     Tip(Symbol),
+    Admin,
+    FeeBps,
+    FeeRecipient,
     Escrow(Symbol),
     Config,
 }
@@ -81,42 +96,33 @@ pub struct MarketContract;
 
 #[contractimpl]
 impl MarketContract {
-    // -------------------------------------------------------------------------
-    // Initialize
-    // -------------------------------------------------------------------------
-
-    /// Set the contract admin. Must be called once before any other function.
-    /// Panics with "Already initialized" if called more than once.
-    pub fn initialize(env: Env, admin: Address) {
+    /// Initialise the contract — sets admin, fee basis points, and fee recipient
+    pub fn initialize(env: Env, admin: Address, fee_bps: u32, fee_recipient: Address) {
         assert!(
             !env.storage().instance().has(&DataKey::Admin),
             "Already initialized"
         );
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
     }
 
-    // -------------------------------------------------------------------------
-    // Views
-    // -------------------------------------------------------------------------
-
-    /// Returns true if the contract has been initialized.
-    pub fn is_initialized(env: Env) -> bool {
-        env.storage().instance().has(&DataKey::Admin)
-    }
-
-    /// Get the admin address. Panics if not initialized.
+    /// Return the admin address
     pub fn get_admin(env: Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Not initialized")
+        env.storage().instance().get(&DataKey::Admin).expect("Not initialized")
     }
 
-    // -------------------------------------------------------------------------
-    // Tip
-    // -------------------------------------------------------------------------
+    /// Return the fee in basis points (e.g. 100 = 1%)
+    pub fn get_fee_bps(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::FeeBps).expect("Not initialized")
+    }
 
-    /// Send a tip to a worker — transfers tokens directly.
+    /// Return the address that receives collected fees
+    pub fn get_fee_recipient(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::FeeRecipient).expect("Not initialized")
+    }
+
+    /// Send a tip to a worker — transfers tokens directly
     // -----------------------------------------------------------------------
     // Initialise
     // -----------------------------------------------------------------------
@@ -322,63 +328,38 @@ impl MarketContract {
     }
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Address, Env};
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::Env;
 
-    struct TestEnv {
-        env: Env,
-        contract_id: Address,
-        admin: Address,
-    }
-
-    impl TestEnv {
-        /// Returns a contract that has NOT been initialized yet.
-        fn uninit() -> Self {
-            let env = Env::default();
-            env.mock_all_auths();
-            let admin = Address::generate(&env);
-            let contract_id = env.register_contract(None, MarketContract);
-            TestEnv { env, contract_id, admin }
-        }
-
-        /// Returns a contract that has already been initialized.
-        fn new() -> Self {
-            let t = Self::uninit();
-            t.client().initialize(&t.admin);
-            t
-        }
-
-        fn client(&self) -> MarketContractClient {
-            MarketContractClient::new(&self.env, &self.contract_id)
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // initialize
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_initialize_sets_admin() {
-        let t = TestEnv::new();
-        assert_eq!(t.client().get_admin(), t.admin);
+    fn setup() -> (Env, MarketContractClient<'static>, Address, Address) {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, MarketContract);
+        let client = MarketContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let fee_recipient = Address::generate(&env);
+        client.initialize(&admin, &100u32, &fee_recipient);
+        (env, client, admin, fee_recipient)
     }
 
     #[test]
-    fn test_is_initialized_false_before_init() {
-        let t = TestEnv::uninit();
-        assert!(!t.client().is_initialized());
+    fn test_get_admin() {
+        let (_env, client, admin, _) = setup();
+        assert_eq!(client.get_admin(), admin);
     }
 
     #[test]
-    fn test_is_initialized_true_after_init() {
-        let t = TestEnv::new();
-        assert!(t.client().is_initialized());
+    fn test_get_fee_bps() {
+        let (_env, client, _, _) = setup();
+        assert_eq!(client.get_fee_bps(), 100u32);
+    }
+
+    #[test]
+    fn test_get_fee_recipient() {
+        let (_env, client, _, fee_recipient) = setup();
+        assert_eq!(client.get_fee_recipient(), fee_recipient);
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub enum DataKey {
     Worker(Symbol),
     /// Persistent storage — ordered list of worker ids
     WorkerList,
+    Admin,
 }
 
 // =============================================================================
@@ -32,11 +33,7 @@ pub struct RegistryContract;
 
 #[contractimpl]
 impl RegistryContract {
-    // -------------------------------------------------------------------------
-    // Initialise
-    // -------------------------------------------------------------------------
-
-    /// Set the contract admin. Must be called once before any other function.
+    /// Initialise the contract and set the admin address
     pub fn initialize(env: Env, admin: Address) {
         assert!(
             !env.storage().instance().has(&DataKey::Admin),
@@ -475,6 +472,36 @@ mod tests {
         t.client().deregister(&t.worker_id(), &t.owner);
         assert!(t.client().get_worker(&t.worker_id()).is_none());
         assert_eq!(t.client().list_workers().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::Env;
+
+    #[test]
+    fn test_get_admin() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, RegistryContract);
+        let client = RegistryContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "Already initialized")]
+    fn test_initialize_twice_panics() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, RegistryContract);
+        let client = RegistryContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        client.initialize(&admin);
     }
 }
 
