@@ -219,6 +219,88 @@ fn test_list_workers_after_toggle_still_listed() {
 }
 
 // ---------------------------------------------------------------------------
+// update_worker
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_update_worker_changes_fields() {
+    let (env, contract) = setup();
+    let owner = Address::generate(&env);
+    let new_wallet = Address::generate(&env);
+    make_worker(&env, &contract, "w1", &owner);
+
+    let client = RegistryContractClient::new(&env, &contract);
+    client.update_worker(
+        &Symbol::new(&env, "w1"),
+        &owner,
+        &String::from_str(&env, "Bob"),
+        &Symbol::new(&env, "electrician"),
+        &new_wallet,
+    );
+
+    let worker = client.get_worker(&Symbol::new(&env, "w1")).unwrap();
+    assert_eq!(worker.name, String::from_str(&env, "Bob"));
+    assert_eq!(worker.category, Symbol::new(&env, "electrician"));
+    assert_eq!(worker.wallet, new_wallet);
+}
+
+#[test]
+fn test_update_worker_preserves_owner_and_active() {
+    let (env, contract) = setup();
+    let owner = Address::generate(&env);
+    let new_wallet = Address::generate(&env);
+    make_worker(&env, &contract, "w1", &owner);
+
+    let client = RegistryContractClient::new(&env, &contract);
+    client.update_worker(
+        &Symbol::new(&env, "w1"),
+        &owner,
+        &String::from_str(&env, "Bob"),
+        &Symbol::new(&env, "electrician"),
+        &new_wallet,
+    );
+
+    let worker = client.get_worker(&Symbol::new(&env, "w1")).unwrap();
+    assert_eq!(worker.owner, owner);
+    assert!(worker.is_active);
+}
+
+#[test]
+#[should_panic(expected = "Not authorized")]
+fn test_update_worker_non_owner_panics() {
+    let (env, contract) = setup();
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    make_worker(&env, &contract, "w1", &owner);
+
+    let client = RegistryContractClient::new(&env, &contract);
+    client.update_worker(
+        &Symbol::new(&env, "w1"),
+        &stranger,
+        &String::from_str(&env, "Eve"),
+        &Symbol::new(&env, "hacker"),
+        &stranger,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Worker not found")]
+fn test_update_worker_nonexistent_panics() {
+    let (env, contract) = setup();
+    let caller = Address::generate(&env);
+
+    let client = RegistryContractClient::new(&env, &contract);
+    client.update_worker(
+        &Symbol::new(&env, "ghost"),
+        &caller,
+        &String::from_str(&env, "Nobody"),
+        &Symbol::new(&env, "none"),
+        &caller,
+    );
+}
+
+#[test]
+fn test_update_worker_idempotent() {
 // worker_count
 // ---------------------------------------------------------------------------
 
@@ -238,6 +320,51 @@ fn test_worker_count_after_registrations() {
     make_worker(&env, &contract, "w3", &owner);
 
     let client = RegistryContractClient::new(&env, &contract);
+    client.deregister(&Symbol::new(&env, "w2"), &owner);
+
+    let list = client.list_workers();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list.get(0).unwrap(), Symbol::new(&env, "w1"));
+    assert_eq!(list.get(1).unwrap(), Symbol::new(&env, "w3"));
+}
+
+#[test]
+fn test_deregister_last_worker_empties_list() {
+    let (env, contract) = setup();
+    let owner = Address::generate(&env);
+    make_worker(&env, &contract, "w1", &owner);
+
+    let client = RegistryContractClient::new(&env, &contract);
+    client.deregister(&Symbol::new(&env, "w1"), &owner);
+
+    assert_eq!(client.list_workers().len(), 0);
+}
+
+#[test]
+#[should_panic(expected = "Not authorized")]
+fn test_deregister_non_owner_panics() {
+    let (env, contract) = setup();
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    make_worker(&env, &contract, "w1", &owner);
+
+    let client = RegistryContractClient::new(&env, &contract);
+    client.deregister(&Symbol::new(&env, "w1"), &stranger);
+}
+
+#[test]
+#[should_panic(expected = "Worker not found")]
+fn test_deregister_nonexistent_worker_panics() {
+    let (env, contract) = setup();
+    let caller = Address::generate(&env);
+
+    let client = RegistryContractClient::new(&env, &contract);
+    client.deregister(&Symbol::new(&env, "ghost"), &caller);
+}
+
+#[test]
+#[should_panic(expected = "Worker not found")]
+fn test_deregister_twice_panics() {
     assert_eq!(client.worker_count(), 3);
 }
 
@@ -313,6 +440,19 @@ fn test_paginated_limit_zero_returns_empty() {
     make_worker(&env, &contract, "w1", &owner);
 
     let client = RegistryContractClient::new(&env, &contract);
+    // update twice with same values
+    for _ in 0..2 {
+        client.update_worker(
+            &Symbol::new(&env, "w1"),
+            &owner,
+            &String::from_str(&env, "Alice"),
+            &Symbol::new(&env, "plumber"),
+            &owner,
+        );
+    }
+
+    let worker = client.get_worker(&Symbol::new(&env, "w1")).unwrap();
+    assert_eq!(worker.name, String::from_str(&env, "Alice"));
     let page = client.list_workers_paginated(&0, &0);
     assert_eq!(page.len(), 0);
 }

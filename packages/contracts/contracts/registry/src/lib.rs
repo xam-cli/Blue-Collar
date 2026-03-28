@@ -6,6 +6,7 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
 };
+use bluecollar_types::Worker;
 
 /// ~1 year in ledgers (5s per ledger)
 const TTL_EXTEND_TO: u32 = 535_000;
@@ -280,6 +281,37 @@ impl RegistryContract {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Update a worker's name, category, and wallet address (owner only).
+    ///
+    /// Emits: WrkUpd
+    pub fn update_worker(
+        env: Env,
+        id: Symbol,
+        caller: Address,
+        name: String,
+        category: Symbol,
+        wallet: Address,
+    ) {
+        caller.require_auth();
+
+        let mut worker: Worker = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Worker(id.clone()))
+            .expect("Worker not found");
+
+        assert!(worker.owner == caller, "Not authorized");
+
+        worker.name = name.clone();
+        worker.category = category.clone();
+        worker.wallet = wallet.clone();
+        env.storage().persistent().set(&DataKey::Worker(id.clone()), &worker);
+
+        // topics: ("WrkUpd", id, caller)  data: (name, category, wallet)
+        env.events().publish(
+            (symbol_short!("WrkUpd"), id, caller),
+            (name, category, wallet),
+        );
     /// Return a page of worker ids starting at `offset`, up to `limit` items.
     pub fn list_workers_paginated(env: Env, offset: u32, limit: u32) -> Vec<Symbol> {
         let list: Vec<Symbol> = env
@@ -309,6 +341,16 @@ impl RegistryContract {
             .persistent()
             .get(&DataKey::WorkerList)
             .unwrap_or(Vec::new(&env));
+        if let Some(pos) = list.iter().position(|x| x == id) {
+            list.remove(pos as u32);
+        }
+        env.storage().persistent().set(&DataKey::WorkerList, &list);
+
+        // topics: ("WrkDrg", id, caller)  data: ()
+        env.events().publish(
+            (symbol_short!("WrkDrg"), id, caller),
+            (),
+        );
         list.len()
     }
 
