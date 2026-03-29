@@ -34,6 +34,8 @@ Many skilled workers lack a platform to help them get noticed. Meanwhile, countl
 - [Quick Start Guide](packages/api/QUICK_START_GUIDE.md)
 - [API Documentation](packages/api/DOCUMENTATION.json)
 - [Security Policy](packages/api/SECURITY.md)
+- [Contributing Guide](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
 - [Frontend Contributing Guide](packages/app/CONTRIBUTING.md)
 
 ---
@@ -318,6 +320,31 @@ stellar contract invoke \
   -- extend_worker_ttl \
   --id <worker-id>
 ```
+
+---
+
+## Docker
+
+The quickest way to run the API and database locally is with Docker Compose.
+
+```bash
+# Copy and fill in the API env file first
+cp packages/api/.env.example packages/api/.env
+
+# Start API + PostgreSQL + Adminer
+pnpm docker:up
+
+# Stop and remove containers
+pnpm docker:down
+```
+
+| Service | URL |
+|---|---|
+| API | http://localhost:3000 |
+| Adminer (DB UI) | http://localhost:8080 |
+| PostgreSQL | localhost:5432 |
+
+> The API container runs `prisma migrate deploy` automatically on startup.
 
 ---
 
