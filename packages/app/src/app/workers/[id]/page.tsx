@@ -4,7 +4,11 @@ import { BadgeCheck, MapPin, Mail, Phone, ArrowLeft } from "lucide-react";
 import Link from "next/link";
 import TipModal from "@/components/TipModal";
 import TransactionHistory from "@/components/TransactionHistory";
-import type { Worker, ApiResponse } from "@/types";
+import BookmarkButton from "@/components/BookmarkButton";
+import StarRating from "@/components/StarRating";
+import ReviewCard from "@/components/ReviewCard";
+import ReviewForm from "@/components/ReviewForm";
+import type { Worker, ApiResponse, Review } from "@/types";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3000/api";
 
@@ -13,6 +17,12 @@ async function fetchWorker(id: string): Promise<Worker | null> {
   if (!res.ok) return null;
   const json: ApiResponse<Worker> = await res.json();
   return json.data;
+}
+
+async function fetchReviews(id: string) {
+  const res = await fetch(`${API}/workers/${id}/reviews?limit=10`, { cache: "no-store" });
+  if (!res.ok) return { data: [], averageRating: null, reviewCount: 0 };
+  return res.json() as Promise<{ data: Review[]; averageRating: number | null; reviewCount: number }>;
 }
 
 export async function generateMetadata({
@@ -38,11 +48,14 @@ export default async function WorkerProfilePage({
 }: {
   params: { id: string };
 }) {
-  const data = await fetchWorker(params.id);
+  const [data, reviewsData] = await Promise.all([
+    fetchWorker(params.id),
+    fetchReviews(params.id),
+  ]);
   if (!data) notFound();
 
-  // notFound() throws, but TS doesn't narrow it — cast to satisfy strict null checks
   const worker = data as Worker;
+  const { data: reviews, averageRating, reviewCount } = reviewsData;
 
   const initials = worker.name
     .split(" ")
@@ -63,7 +76,7 @@ export default async function WorkerProfilePage({
 
       <div className="rounded-2xl border bg-white p-8 shadow-sm">
         {/* Avatar + name */}
-        <div className="flex items-center gap-5">
+        <div className="flex items-start gap-5">
           {worker.avatar ? (
             <img
               src={worker.avatar}
@@ -76,7 +89,7 @@ export default async function WorkerProfilePage({
             </div>
           )}
 
-          <div>
+          <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 text-xl font-bold text-gray-900">
               {worker.name}
               {worker.isVerified && (
@@ -86,7 +99,17 @@ export default async function WorkerProfilePage({
             <span className="mt-1 inline-block rounded-full bg-blue-50 px-3 py-0.5 text-sm font-medium text-blue-600">
               {worker.category.name}
             </span>
+            {averageRating != null && (
+              <div className="mt-2 flex items-center gap-1.5">
+                <StarRating rating={averageRating} />
+                <span className="text-sm text-gray-500">
+                  {averageRating.toFixed(1)} ({reviewCount} review{reviewCount !== 1 ? "s" : ""})
+                </span>
+              </div>
+            )}
           </div>
+
+          <BookmarkButton workerId={worker.id} />
         </div>
 
         {/* Bio */}
@@ -139,6 +162,28 @@ export default async function WorkerProfilePage({
             <p className="text-sm text-gray-400 italic">
               This worker hasn&apos;t connected a wallet yet.
             </p>
+          )}
+        </div>
+
+        {/* Reviews section */}
+        <div className="mt-8 border-t pt-6">
+          <h2 className="text-base font-semibold text-gray-900 mb-4">
+            Reviews {reviewCount > 0 && `(${reviewCount})`}
+          </h2>
+
+          <div className="mb-6">
+            <p className="text-sm font-medium text-gray-700 mb-3">Leave a review</p>
+            <ReviewForm workerId={worker.id} onReviewCreated={() => {}} />
+          </div>
+
+          {reviews.length > 0 ? (
+            <div>
+              {reviews.map((review) => (
+                <ReviewCard key={review.id} review={review} />
+              ))}
+            </div>
+          ) : (
+            <p className="text-sm text-gray-400 italic">No reviews yet. Be the first!</p>
           )}
         </div>
       </div>
