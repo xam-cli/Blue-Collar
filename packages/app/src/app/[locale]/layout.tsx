@@ -1,10 +1,12 @@
 import type { ReactNode } from "react";
 import { AuthProvider } from "@/context/AuthContext";
 import { WalletProvider } from "@/context/WalletContext";
+import { CompareProvider } from "@/context/CompareContext";
 import { ThemeProvider } from "next-themes";
 import { Toaster } from "sonner";
 import { NextIntlClientProvider } from 'next-intl'
 import { getMessages } from 'next-intl/server'
+import CompareDrawer from "@/components/CompareDrawer";
 
 export default async function LocaleLayout({ 
   children, 
@@ -21,7 +23,12 @@ export default async function LocaleLayout({
         <NextIntlClientProvider messages={messages}>
           <ThemeProvider attribute="class" defaultTheme="system" enableSystem storageKey="bc_theme">
             <AuthProvider>
-              <WalletProvider>{children}</WalletProvider>
+              <WalletProvider>
+                <CompareProvider>
+                  {children}
+                  <CompareDrawer />
+                </CompareProvider>
+              </WalletProvider>
             </AuthProvider>
             <Toaster position="bottom-right" richColors closeButton />
           </ThemeProvider>
