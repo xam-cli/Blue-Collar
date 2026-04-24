@@ -27,6 +27,7 @@ Many skilled workers lack a platform to help them get noticed. Meanwhile, countl
 - [Smart Contracts](#smart-contracts)
 - [Getting Started](#getting-started)
 - [Environment Variables](#environment-variables)
+- [Production Deployment](#production-deployment)
 - [Roadmap](#roadmap)
 - [Community](#community)
 - [Contributing](#contributing)
@@ -56,6 +57,8 @@ Many skilled workers lack a platform to help them get noticed. Meanwhile, countl
 
 ## Architecture
 
+![BlueCollar Architecture](docs/architecture/system-overview.svg)
+
 ```
 User / Browser
       │
@@ -75,6 +78,8 @@ User / Browser
 - The **Registry Contract** (Rust/Soroban) anchors worker registrations on the Stellar blockchain, providing immutable proof of listing.
 - The **Market Contract** (Rust/Soroban) handles on-chain tip/payment transfers between users and workers using Stellar tokens (XLM or custom assets).
 - The **App** is a Next.js frontend that consumes the API and interacts with Stellar wallets (Freighter, etc.).
+
+Diagram maintenance note: update `docs/architecture/system-overview.svg` whenever major architectural relationships or data flows change.
 
 ---
 
@@ -405,6 +410,18 @@ All variables for the API live in `packages/api/.env` (copy from `.env.example`)
 | `MAIL_USER`            | SMTP username                          |
 | `MAIL_PASS`            | SMTP password                          |
 | `APP_URL`              | Public URL of the app (used in emails) |
+
+---
+
+## Production Deployment
+
+Use the production runbook in [docs/PRODUCTION_DEPLOYMENT.md](./docs/PRODUCTION_DEPLOYMENT.md) for:
+
+- API/app/database environment setup
+- Docker production examples
+- SSL/TLS reverse-proxy setup
+- Monitoring and logging recommendations
+- Backup and disaster recovery procedures
 
 ---
 

@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
-import { BadgeCheck, MapPin, Mail, Phone, ArrowLeft, QrCode } from "lucide-react";
+import { BadgeCheck, MapPin, Mail, Phone, ArrowLeft } from "lucide-react";
 import Link from "next/link";
 import TipModal from "@/components/TipModal";
 import TransactionHistory from "@/components/TransactionHistory";
@@ -9,6 +9,9 @@ import StarRating from "@/components/StarRating";
 import ReviewCard from "@/components/ReviewCard";
 import ReviewForm from "@/components/ReviewForm";
 import QRCodeButton from "@/components/QRCodeButton";
+import EmptyState from "@/components/EmptyState";
+import AvailabilityCalendar from "@/components/AvailabilityCalendar";
+import ZoomableAvatar from "@/components/ZoomableAvatar";
 import type { Worker, ApiResponse, Review } from "@/types";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3000/api";
@@ -24,6 +27,13 @@ async function fetchReviews(id: string) {
   const res = await fetch(`${API}/workers/${id}/reviews?limit=10`, { cache: "no-store" });
   if (!res.ok) return { data: [], averageRating: null, reviewCount: 0 };
   return res.json() as Promise<{ data: Review[]; averageRating: number | null; reviewCount: number }>;
+}
+
+async function fetchAvailability(id: string) {
+  const res = await fetch(`${API}/workers/${id}/availability`, { cache: "no-store" });
+  if (!res.ok) return [];
+  const json = await res.json();
+  return (json.data ?? []) as { dayOfWeek: number; startTime: string; endTime: string }[];
 }
 
 export async function generateMetadata({
@@ -49,9 +59,10 @@ export default async function WorkerProfilePage({
 }: {
   params: { id: string };
 }) {
-  const [data, reviewsData] = await Promise.all([
+  const [data, reviewsData, availability] = await Promise.all([
     fetchWorker(params.id),
     fetchReviews(params.id),
+    fetchAvailability(params.id),
   ]);
   if (!data) notFound();
 
@@ -79,10 +90,10 @@ export default async function WorkerProfilePage({
         {/* Avatar + name */}
         <div className="flex items-start gap-5">
           {worker.avatar ? (
-            <img
+            <ZoomableAvatar
               src={worker.avatar}
               alt={worker.name}
-              className="h-20 w-20 rounded-full object-cover ring-2 ring-blue-100"
+              className="h-20 w-20 rounded-full object-cover ring-2 ring-blue-100 cursor-zoom-in"
             />
           ) : (
             <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-full bg-blue-100 text-blue-600 font-bold text-2xl">
@@ -148,6 +159,11 @@ export default async function WorkerProfilePage({
           )}
         </div>
 
+        {/* Availability calendar */}
+        <div className="mt-8 border-t pt-6">
+          <AvailabilityCalendar availability={availability} />
+        </div>
+
         {/* Tip section */}
         <div className="mt-8 border-t pt-6">
           {worker.walletAddress ? (
@@ -188,7 +204,7 @@ export default async function WorkerProfilePage({
               ))}
             </div>
           ) : (
-            <p className="text-sm text-gray-400 italic">No reviews yet. Be the first!</p>
+            <EmptyState variant="no-reviews" ctaHref="#review-form" />
           )}
         </div>
       </div>
