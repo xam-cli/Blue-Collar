@@ -34,6 +34,7 @@ Many skilled workers lack a platform to help them get noticed. Meanwhile, countl
 - [License](#license)
 - [Quick Start Guide](packages/api/QUICK_START_GUIDE.md)
 - [API Documentation](packages/api/DOCUMENTATION.json)
+- [API cURL Examples](packages/api/CURL_EXAMPLES.md)
 - [Security Policy](packages/api/SECURITY.md)
 - [Contributing Guide](CONTRIBUTING.md)
 - [Code of Conduct](CODE_OF_CONDUCT.md)
