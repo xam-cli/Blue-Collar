@@ -3,3 +3,7 @@ dist
 .env
 *.log
 .DS_Store
+storage/uploads/*
+!storage/uploads/.gitkeep
+
+packages/api_backup/

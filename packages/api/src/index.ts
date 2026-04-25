@@ -1,6 +1,11 @@
 // Entry point for BlueCollar API
 import express from 'express'
 import cors from 'cors'
+import helmet from 'helmet'
+import { corsConfig } from './config/cors.js'
+import { env } from './config/env.js'
+import pinoHttp from 'pino-http'
+import methodOverride from 'method-override'
 import passport from './config/passport.js'
 import authRoutes from './routes/auth.js'
 import categoryRoutes from './routes/categories.js'
@@ -10,12 +15,20 @@ import reviewRoutes from './routes/reviews.js'
 import subscriptionRoutes from './routes/subscriptions.js'
 
 const app = express()
-const PORT = process.env.PORT || 3000
+const PORT = env.PORT || 3000
 
-app.use(cors())
-app.use(express.json())
-app.use(express.urlencoded({ extended: true }))
-app.use(passport.initialize())
+// Apply Helmet for HTTP security headers
+// strict CSP since we only serve JSON, not HTML
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'none'"],
+      baseUri: ["'none'"],
+      formAction: ["'none'"],
+      frameAncestors: ["'none'"],
+    },
+  },
+}))
 
 app.use('/api/auth', authRoutes)
 app.use('/api/categories', categoryRoutes)
@@ -24,12 +37,9 @@ app.use('/api/workers/:workerId/portfolio', portfolioRoutes)
 app.use('/api/workers/:workerId/reviews', reviewRoutes)
 app.use('/api/subscriptions', subscriptionRoutes)
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'bluecollar-api' })
-})
+// Global error handler - must be last
+app.use(errorHandler)
 
 app.listen(PORT, () => {
-  console.log(`BlueCollar API running on port ${PORT}`)
+  logger.info(`BlueCollar API running on port ${PORT}`)
 })
-
-export default app

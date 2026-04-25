@@ -1,208 +1,198 @@
-import type { Request, Response } from 'express'
-import { db } from '../db.js'
-import argon2 from 'argon2'
-import jwt from 'jsonwebtoken'
-import crypto from 'node:crypto'
-import { sendVerificationEmail, sendPasswordResetEmail } from '../mailer/index.js'
+import type { Request, Response } from "express";
+import jwt from "jsonwebtoken";
+import { env } from "../config/env.js";
+import * as authService from "../services/auth.service.js";
+import { handleError } from "../utils/handleError.js";
+import { db } from "../db.js";
+import { sanitizeUser } from "../models/user.model.js";
+import { UserResource } from "../resources/index.js";
+import { AppError } from "../services/AppError.js";
+import { catchAsync } from "../utils/catchAsync.js";
+import type {
+  LoginBody,
+  RegisterBody,
+  ForgotPasswordBody,
+  ResetPasswordBody,
+} from "../interfaces/index.js";
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Sign a short-lived verification JWT and return both the raw token and its SHA-256 hash. */
-function generateVerificationToken(userId: string): { raw: string; hash: string; expiry: Date } {
-  const raw = jwt.sign({ id: userId, purpose: 'email-verify' }, process.env.JWT_SECRET!, {
-    expiresIn: '24h',
-  })
-  const hash = crypto.createHash('sha256').update(raw).digest('hex')
-  const expiry = new Date(Date.now() + 24 * 60 * 60 * 1000)
-  return { raw, hash, expiry }
-}
-
-// ---------------------------------------------------------------------------
-// Controllers
-// ---------------------------------------------------------------------------
-
-export async function login(req: Request, res: Response) {
-  const { email, password } = req.body
-
-  const user = await db.user.findUnique({ where: { email } })
-  if (!user || !(await argon2.verify(user.password, password))) {
-    return res.status(401).json({ status: 'error', message: 'Invalid credentials', code: 401 })
-  }
-
-  // Block login for unverified accounts
-  if (!user.verified) {
-    return res.status(403).json({
-      status: 'error',
-      message:
-        'Your email address has not been verified. Please check your inbox and click the verification link.',
-      code: 403,
-    })
-  }
-
-  const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET!, {
-    expiresIn: '7d',
-  })
-  const { password: _, verificationToken: __, verificationTokenExpiry: ___, ...data } = user
-  return res.status(202).json({ data, status: 'success', message: 'Login successful', code: 202, token })
-}
-
-export async function register(req: Request, res: Response) {
-  const { email, password, firstName, lastName } = req.body
-
-  // Check for existing account before hashing
-  const existing = await db.user.findUnique({ where: { email } })
-  if (existing) {
-    return res.status(409).json({ status: 'error', message: 'Email already in use', code: 409 })
-  }
-
-  const hashed = await argon2.hash(password)
-  const user = await db.user.create({ data: { email, password: hashed, firstName, lastName } })
-
-  // Generate verification token and persist its hash
-  const { raw, hash, expiry } = generateVerificationToken(user.id)
-  await db.user.update({
-    where: { id: user.id },
-    data: { verificationToken: hash, verificationTokenExpiry: expiry },
-  })
-
-  // Fire-and-forget the verification email (failures logged, not surfaced to client)
-  sendVerificationEmail(email, firstName, raw).catch((err) =>
-    console.error('[mailer] Failed to send verification email:', err),
-  )
-
-  const { password: _, verificationToken: __, verificationTokenExpiry: ___, ...data } = user
-  return res.status(201).json({
-    data,
-    status: 'success',
-    message: 'Registration successful. Please check your email to verify your account.',
-    code: 201,
-  })
-}
-
-export async function verifyAccount(req: Request, res: Response) {
-  const token = (req.query.token ?? req.body.token) as string | undefined
-
-  if (!token) {
-    return res.status(400).json({ status: 'error', message: 'Verification token is required', code: 400 })
-  }
-
-  // Decode without verifying first so we can extract the user id
-  let payload: { id?: string; purpose?: string }
+/**
+ * POST /api/auth/login
+ * Authenticate a user with email and password.
+ *
+ * @param req - Body: `{ email, password }`.
+ * @param res - JSON `{ data: User, token, status, code: 202 }`.
+ * @throws AppError 401 if credentials are invalid.
+ * @throws AppError 403 if the account is not yet verified.
+ */
+export async function login(req: Request<{}, {}, LoginBody>, res: Response) {
   try {
-    payload = jwt.verify(token, process.env.JWT_SECRET!) as { id: string; purpose: string }
-  } catch {
-    return res.status(400).json({ status: 'error', message: 'Token is invalid or has expired', code: 400 })
+    const { data, token } = await authService.loginUser(req.body);
+    return res.status(202).json({
+      data: UserResource(data as any),
+      status: "success",
+      message: "Login successful",
+      code: 202,
+      token,
+    });
+  } catch (err) {
+    return handleError(res, err);
   }
-
-  if (payload.purpose !== 'email-verify' || !payload.id) {
-    return res.status(400).json({ status: 'error', message: 'Invalid verification token', code: 400 })
-  }
-
-  const user = await db.user.findUnique({ where: { id: payload.id } })
-  if (!user) {
-    return res.status(404).json({ status: 'error', message: 'User not found', code: 404 })
-  }
-
-  if (user.verified) {
-    return res.status(200).json({ status: 'success', message: 'Email already verified', code: 200 })
-  }
-
-  // Compare token hash
-  const incomingHash = crypto.createHash('sha256').update(token).digest('hex')
-  const tokenMatches = incomingHash === user.verificationToken
-  const notExpired =
-    user.verificationTokenExpiry && user.verificationTokenExpiry > new Date()
-
-  if (!tokenMatches || !notExpired) {
-    return res.status(400).json({ status: 'error', message: 'Token is invalid or has expired', code: 400 })
-  }
-
-  await db.user.update({
-    where: { id: user.id },
-    data: { verified: true, verificationToken: null, verificationTokenExpiry: null },
-  })
-
-  return res.status(200).json({ status: 'success', message: 'Email verified successfully', code: 200 })
 }
 
+/**
+ * POST /api/auth/register
+ * Create a new user account and send a verification email.
+ *
+ * @param req - Body: `{ email, password, firstName, lastName }`.
+ * @param res - JSON `{ data: User, status, code: 201 }`.
+ * @throws AppError 409 if the email is already in use.
+ */
+export async function register(
+  req: Request<{}, {}, RegisterBody>,
+  res: Response,
+) {
+  try {
+    const data = await authService.registerUser(req.body);
+    return res.status(201).json({
+      data: UserResource(data as any),
+      status: "success",
+      message:
+        "Registration successful. Please check your email to verify your account.",
+      code: 201,
+    });
+  } catch (err) {
+    return handleError(res, err);
+  }
+}
+
+/**
+ * PUT /api/auth/verify-account
+ * Verify a user's email address using the token sent in the verification email.
+ *
+ * @param req - Query param or body field `token`.
+ * @param res - JSON `{ status, message, code: 200 }`.
+ * @throws AppError 400 if the token is missing, invalid, or expired.
+ */
+export const verifyAccount = catchAsync(async (req: Request, res: Response) => {
+  const token = (req.query.token ?? req.body.token) as string | undefined;
+  if (!token) {
+    throw new AppError("Verification token is required", 400);
+  }
+  try {
+    const verified = await authService.verifyAccount(token);
+    const message = verified
+      ? "Email verified successfully"
+      : "Email already verified";
+    return res.status(200).json({ status: "success", message, code: 200 });
+  } catch (err) {
+    return handleError(res, err);
+  }
+});
+
+/**
+ * GET /api/auth/google/callback
+ * Handle the Google OAuth callback. Issues a JWT and redirects to the frontend.
+ *
+ * @param req - `req.user` is populated by Passport's Google strategy.
+ * @param res - Redirects to `APP_URL/auth-callback?token=<jwt>` on success,
+ *              or `APP_URL/login?error=oauth-failed` on failure.
+ */
 export async function googleAuthCallback(req: Request, res: Response) {
-  const user = req.user as any
-
-  if (!user) {
-    return res.redirect(`${process.env.APP_URL}/login?error=oauth-failed`)
-  }
-
-  const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET!, {
-    expiresIn: '7d',
-  })
-
-  // Redirect to frontend with token as query param
-  return res.redirect(`${process.env.APP_URL}/auth-callback?token=${token}`)
+  const user = req.user as any;
+  if (!user) return res.redirect(`${env.APP_URL}/login?error=oauth-failed`);
+  const token = jwt.sign({ id: user.id, role: user.role }, env.JWT_SECRET, {
+    expiresIn: "7d",
+  });
+  return res.redirect(`${env.APP_URL}/auth-callback?token=${token}`);
 }
 
+/**
+ * DELETE /api/auth/logout
+ * Stateless logout — instructs the client to discard its JWT.
+ *
+ * @param _req - Unused.
+ * @param res - JSON `{ status, message, code: 200 }`.
+ */
 export async function logout(_req: Request, res: Response) {
-  return res.status(200).json({ status: 'success', message: 'Logged out', code: 200 })
+  return res
+    .status(200)
+    .json({ status: "success", message: "Logged out", code: 200 });
 }
 
-export async function forgotPassword(req: Request, res: Response) {
-  const { email } = req.body
-
-  const user = await db.user.findUnique({ where: { email } })
-
-  // Security: Always return 200 to prevent user enumeration
-  if (user) {
-    const rawToken = crypto.randomBytes(32).toString('hex')
-    const hash = crypto.createHash('sha256').update(rawToken).digest('hex')
-    const expiry = new Date(Date.now() + 60 * 60 * 1000) // 1 hour
-
-    await db.user.update({
-      where: { id: user.id },
-      data: { resetToken: hash, resetTokenExpiry: expiry },
-    })
-
-    sendPasswordResetEmail(user.email, user.firstName, rawToken).catch((err) =>
-      console.error('[mailer] Failed to send password reset email:', err),
-    )
+/**
+ * GET /api/auth/me
+ * Return the currently authenticated user's profile.
+ *
+ * @param req - `req.user` must be set by the `authenticate` middleware.
+ * @param res - JSON `{ data: User, status, code: 200 }`.
+ * @throws 404 if the user record no longer exists.
+ */
+export async function me(req: Request, res: Response) {
+  try {
+    const { id } = req.user!;
+    const user = await db.user.findUnique({ where: { id } });
+    if (!user)
+      return res
+        .status(404)
+        .json({ status: "error", message: "User not found", code: 404 });
+    return res
+      .status(200)
+      .json({ data: sanitizeUser(user), status: "success", code: 200 });
+  } catch (err) {
+    return handleError(res, err);
   }
-
-  return res.status(200).json({
-    status: 'success',
-    message: 'If an account exists with that email, a password reset link has been sent.',
-    code: 200,
-  })
 }
 
-export async function resetPassword(req: Request, res: Response) {
-  const { token, password } = req.body
+/**
+ * POST /api/auth/forgot-password
+ * Send a password reset email. Always returns 200 to prevent email enumeration.
+ *
+ * @param req - Body: `{ email }`.
+ * @param res - JSON `{ status, message, code: 200 }`.
+ */
+export async function forgotPassword(
+  req: Request<{}, {}, ForgotPasswordBody>,
+  res: Response,
+) {
+  try {
+    await authService.requestPasswordReset(req.body.email);
+    return res.status(200).json({
+      status: "success",
+      message:
+        "If an account exists with that email, a password reset link has been sent.",
+      code: 200,
+    });
+  } catch (err) {
+    return handleError(res, err);
+  }
+}
 
+/**
+ * PUT /api/auth/reset-password
+ * Reset a user's password using the token from the reset email.
+ *
+ * @param req - Body: `{ token, password }`.
+ * @param res - JSON `{ status, message, code: 200 }`.
+ * @throws AppError 400 if `token` or `password` is missing, or if the token is invalid/expired.
+ */
+export async function resetPassword(
+  req: Request<{}, {}, ResetPasswordBody>,
+  res: Response,
+) {
+  const { token, password } = req.body;
   if (!token || !password) {
-    return res.status(400).json({ status: 'error', message: 'Token and password are required', code: 400 })
+    throw new AppError("Token and password are required", 400);
   }
-
-  const hash = crypto.createHash('sha256').update(token).digest('hex')
-  const user = await db.user.findFirst({
-    where: {
-      resetToken: hash,
-      resetTokenExpiry: { gt: new Date() },
-    },
-  })
-
-  if (!user) {
-    return res.status(400).json({ status: 'error', message: 'Token is invalid or has expired', code: 400 })
+  try {
+    await authService.resetPassword(token, password);
+    return res
+      .status(200)
+      .json({
+        status: "success",
+        message: "Password reset successful",
+        code: 200,
+      });
+  } catch (err) {
+    return handleError(res, err);
   }
-
-  const hashedPassword = await argon2.hash(password)
-
-  await db.user.update({
-    where: { id: user.id },
-    data: {
-      password: hashedPassword,
-      resetToken: null,
-      resetTokenExpiry: null,
-    },
-  })
-
-  return res.status(200).json({ status: 'success', message: 'Password reset successful', code: 200 })
 }
