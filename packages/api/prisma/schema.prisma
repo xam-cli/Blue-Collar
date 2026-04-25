@@ -18,6 +18,7 @@ model Location {
   lng     Float?
   users   User[]
   workers Worker[]
+  jobs    Job[]
 }
 
 model User {
@@ -37,12 +38,16 @@ model User {
   verificationTokenExpiry DateTime?
   resetToken              String?   @unique
   resetTokenExpiry        DateTime?
+  twoFactorSecret         String?
+  twoFactorEnabled        Boolean   @default(false)
+  twoFactorBackupCodes    String[]  @default([])
   locationId    String?
   location      Location? @relation(fields: [locationId], references: [id])
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
   workers       Worker[]
   reviews       Review[]
+  bookmarks     Bookmark[]
   contactRequests ContactRequest[]
   pushSubscriptions PushSubscription[]
   disputesFiled   Dispute[] @relation("DisputesFiled")
@@ -62,6 +67,7 @@ model Category {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
   workers     Worker[]
+  jobs        Job[]
 }
 
 model Worker {
@@ -250,4 +256,62 @@ enum DisputeStatus {
   under_review
   resolved
   dismissed
+}
+
+enum ReviewStatus {
+  pending
+  approved
+  rejected
+}
+
+enum SubscriptionTier {
+  free
+  pro
+  premium
+}
+
+enum JobStatus {
+  open
+  closed
+  expired
+  filled
+}
+
+enum ApplicationStatus {
+  pending
+  accepted
+  rejected
+  withdrawn
+}
+
+model Job {
+  id          String      @id @default(cuid())
+  title       String
+  description String
+  budget      Float?
+  categoryId  String
+  category    Category    @relation(fields: [categoryId], references: [id])
+  locationId  String?
+  location    Location?   @relation(fields: [locationId], references: [id])
+  postedById  String
+  postedBy    User        @relation("JobsPosted", fields: [postedById], references: [id])
+  status      JobStatus   @default(open)
+  expiresAt   DateTime?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  applications JobApplication[]
+}
+
+model JobApplication {
+  id          String            @id @default(cuid())
+  jobId       String
+  job         Job               @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  workerId    String
+  worker      Worker            @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  coverLetter String?
+  status      ApplicationStatus @default(pending)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@unique([jobId, workerId])
 }

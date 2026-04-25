@@ -9,6 +9,14 @@ import {
   verifyAccount,
   googleAuthCallback,
 } from '../controllers/auth.js'
+import {
+  setup2FA,
+  enable2FA,
+  verify2FA,
+  verifyBackupCode,
+  disable2FA,
+  regenerateBackupCodes,
+} from '../controllers/twoFactor.js'
 import { authenticate } from '../middleware/auth.js'
 import { validate } from '../middleware/validate.js'
 import { authRateLimiter } from '../config/rateLimiter.js'
@@ -58,5 +66,13 @@ router.post('/forgot-password', validate(forgotPasswordRules), forgotPassword)
 // Validates the raw reset token (hashed and compared server-side), then
 // updates the password and clears the reset token fields.
 router.put('/reset-password', validate(resetPasswordRules), resetPassword)
+
+// ── Two-Factor Authentication (TOTP) ─────────────────────────────────────────
+router.post('/2fa/setup', authenticate, setup2FA)
+router.post('/2fa/enable', authenticate, enable2FA)
+router.post('/2fa/verify', verify2FA)
+router.post('/2fa/verify-backup', verifyBackupCode)
+router.delete('/2fa', authenticate, disable2FA)
+router.post('/2fa/backup-codes/regenerate', authenticate, regenerateBackupCodes)
 
 export default router

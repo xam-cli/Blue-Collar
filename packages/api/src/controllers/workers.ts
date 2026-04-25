@@ -18,7 +18,12 @@ function haversine(lat1: number, lon1: number, lat2: number, lon2: number): numb
 }
 
 export async function listWorkers(req: Request, res: Response) {
-  const { category, page = '1', limit = '20', lat, lng, radius } = req.query
+  const {
+    category, page = '1', limit = '20', lat, lng, radius,
+    search, lang, city, state, country,
+    minRating, maxRating, available, listedSince,
+    categories, sortBy, sortOrder, isVerified,
+  } = req.query
 
   // Geo search: if lat/lng/radius provided, filter by proximity using Haversine
   if (lat && lng) {
@@ -52,16 +57,31 @@ export async function listWorkers(req: Request, res: Response) {
     return res.json({ data: paginated, status: 'success', code: 200 })
   }
 
-  const workers = await db.worker.findMany({
-    where: {
-      isActive: true,
-      ...(category ? { categoryId: String(category) } : {}),
-    },
-    skip: (Number(page) - 1) * Number(limit),
-    take: Number(limit),
-    include: { category: true },
+  // Parse multi-category: ?categories=id1,id2,id3
+  const categoryIds = categories
+    ? String(categories).split(',').map(s => s.trim()).filter(Boolean)
+    : undefined
+
+  const result = await workerService.listWorkers({
+    category: category ? String(category) : undefined,
+    categories: categoryIds,
+    page: Number(page),
+    limit: Number(limit),
+    search: search ? String(search) : undefined,
+    lang: lang ? String(lang) : undefined,
+    city: city ? String(city) : undefined,
+    state: state ? String(state) : undefined,
+    country: country ? String(country) : undefined,
+    minRating: minRating ? Number(minRating) : undefined,
+    maxRating: maxRating ? Number(maxRating) : undefined,
+    available: available !== undefined ? Number(available) : undefined,
+    listedSince: listedSince ? Number(listedSince) : undefined,
+    sortBy: sortBy as any,
+    sortOrder: sortOrder as any,
+    isVerified: isVerified !== undefined ? isVerified === 'true' : undefined,
   })
-  return res.json({ data: workers, status: 'success', code: 200 })
+
+  return res.json({ ...result, status: 'success', code: 200 })
 }
 
 /**
