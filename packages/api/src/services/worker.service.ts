@@ -23,6 +23,7 @@ function safeLang(lang?: string): string {
  */
 export async function listWorkers(opts: {
   category?: string
+  categories?: string[]  // multi-category filter
   page?: number
   limit?: number
   search?: string
@@ -31,27 +32,40 @@ export async function listWorkers(opts: {
   state?: string
   country?: string
   minRating?: number
+  maxRating?: number
   available?: number
   listedSince?: number
+  sortBy?: 'rating' | 'newest' | 'oldest' | 'name'
+  sortOrder?: 'asc' | 'desc'
+  isVerified?: boolean
 }) {
   const {
-    category, page = 1, limit = 20, search, lang,
-    city, state, country, minRating, available, listedSince,
+    category, categories, page = 1, limit = 20, search, lang,
+    city, state, country, minRating, maxRating, available, listedSince,
+    sortBy = 'newest', sortOrder = 'desc', isVerified,
   } = opts
 
   if (search && search.trim()) {
     return listWorkersFullText({
       search: search.trim(),
       lang: safeLang(lang),
-      category, page, limit,
+      category, categories, page, limit,
       city, state, country,
-      minRating, available, listedSince,
+      minRating, maxRating, available, listedSince,
     })
   }
 
+  // Build category filter: multi-category takes precedence over single
+  const categoryFilter = categories && categories.length > 0
+    ? { categoryId: { in: categories } }
+    : category
+    ? { categoryId: category }
+    : {}
+
   const where: any = {
     isActive: true,
-    ...(category ? { categoryId: category } : {}),
+    ...categoryFilter,
+    ...(isVerified !== undefined ? { isVerified } : {}),
     ...(city || state || country
       ? {
           location: {
@@ -67,17 +81,27 @@ export async function listWorkers(opts: {
       : {}),
   }
 
-  if (minRating !== undefined) {
+  if (minRating !== undefined || maxRating !== undefined) {
+    const havingClause: any = {}
+    if (minRating !== undefined) havingClause.gte = minRating
+    if (maxRating !== undefined) havingClause.lte = maxRating
     const qualifiedIds = await db.review.groupBy({
       by: ['workerId'],
       _avg: { rating: true },
-      having: { rating: { _avg: { gte: minRating } } },
+      having: { rating: { _avg: havingClause } },
     })
     where.id = { in: qualifiedIds.map((r: { workerId: string }) => r.workerId) }
   }
 
+  // Build orderBy
+  let orderBy: any = { createdAt: 'desc' }
+  if (sortBy === 'oldest') orderBy = { createdAt: 'asc' }
+  else if (sortBy === 'name') orderBy = { name: sortOrder }
+  else if (sortBy === 'newest') orderBy = { createdAt: sortOrder }
+  // 'rating' sort is handled post-query since it requires aggregation
+
   const [data, total] = await Promise.all([
-    db.worker.findMany({ where, skip: (page - 1) * limit, take: limit, include: workerInclude }),
+    db.worker.findMany({ where, skip: (page - 1) * limit, take: limit, include: workerInclude, orderBy }),
     db.worker.count({ where }),
   ])
 
@@ -93,12 +117,14 @@ interface FtsOpts {
   search: string
   lang: string
   category?: string
+  categories?: string[]
   page: number
   limit: number
   city?: string
   state?: string
   country?: string
   minRating?: number
+  maxRating?: number
   available?: number
   listedSince?: number
 }
@@ -107,7 +133,7 @@ interface FtsOpts {
 const p = (n: number) => '$' + n
 
 async function listWorkersFullText(opts: FtsOpts) {
-  const { search, lang, category, page, limit, city, state, country, minRating, available, listedSince } = opts
+  const { search, lang, category, categories, page, limit, city, state, country, minRating, maxRating, available, listedSince } = opts
   const offset = (page - 1) * limit
 
   // Fixed: p(1)=search, p(2)=lang
@@ -117,7 +143,12 @@ async function listWorkersFullText(opts: FtsOpts) {
   const extraParams: unknown[] = []
   let ci = 3
 
-  if (category) {
+  // Multi-category: use IN clause
+  if (categories && categories.length > 0) {
+    const placeholders = categories.map(() => p(ci++)).join(', ')
+    extraClauses.push('w."categoryId" IN (' + placeholders + ')')
+    extraParams.push(...categories)
+  } else if (category) {
     extraClauses.push('w."categoryId" = ' + p(ci++))
     extraParams.push(category)
   }
@@ -148,6 +179,12 @@ async function listWorkersFullText(opts: FtsOpts) {
       '(SELECT AVG(rv.rating) FROM "Review" rv WHERE rv."workerId" = w.id) >= ' + p(ci++)
     )
     extraParams.push(minRating)
+  }
+  if (maxRating !== undefined) {
+    extraClauses.push(
+      '(SELECT AVG(rv.rating) FROM "Review" rv WHERE rv."workerId" = w.id) <= ' + p(ci++)
+    )
+    extraParams.push(maxRating)
   }
 
   const countWhere = extraClauses.length ? 'AND ' + extraClauses.join(' AND ') : ''
