@@ -15,12 +15,13 @@ import { invalidateCachePattern } from '../middleware/cache.js'
  */
 export async function listWorkers(req: Request<{}, {}, {}, WorkerQuery>, res: Response) {
   try {
-    const { category, page = '1', limit = '20', search, city, state, country, minRating, available, listedSince } = req.query
+    const { category, page = '1', limit = '20', search, lang, city, state, country, minRating, available, listedSince } = req.query
     const { data, meta } = await workerService.listWorkers({
       category,
       page: Number(page),
       limit: Number(limit),
       search,
+      lang,
       city,
       state,
       country,

@@ -167,6 +167,14 @@ export default async function WorkerProfilePage({
           <AvailabilityCalendar availability={availability} />
         </div>
 
+        {/* Portfolio gallery */}
+        {worker.portfolioImages && worker.portfolioImages.length > 0 && (
+          <div className="mt-8 border-t pt-6">
+            <h2 className="text-base font-semibold text-gray-900 mb-4">Portfolio</h2>
+            <PortfolioGallery images={worker.portfolioImages.map((img) => ({ id: img.id, url: img.url, caption: img.caption ?? undefined }))} />
+          </div>
+        )}
+
         {/* Tip section */}
         <div className="mt-8 border-t pt-6">
           {worker.walletAddress ? (

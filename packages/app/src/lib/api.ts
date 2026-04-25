@@ -134,3 +134,16 @@ export const sendContactRequest = (workerId: string, message: string) =>
 // Categories
 export const getCategories = () =>
   request<ApiResponse<Category[]>>("/categories");
+
+// User profile
+export const updateProfile = (data: { firstName?: string; lastName?: string; phone?: string; bio?: string }) =>
+  request<ApiResponse<unknown>>("/users/me", { method: "PATCH", body: data });
+
+export const changePassword = (currentPassword: string, newPassword: string) =>
+  request<{ status: string; message: string }>("/users/me/password", {
+    method: "PUT",
+    body: { currentPassword, newPassword },
+  });
+
+export const deleteAccount = () =>
+  request<{ status: string; message: string }>("/users/me", { method: "DELETE" });
