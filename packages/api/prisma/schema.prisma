@@ -47,6 +47,7 @@ model User {
   pushSubscriptions PushSubscription[]
   disputesFiled   Dispute[] @relation("DisputesFiled")
   disputesResolved Dispute[] @relation("DisputesResolved")
+  interactions    UserInteraction[]
 }
 
 model Category {
@@ -85,6 +86,7 @@ model Worker {
   availability        Availability[]
   contactRequests     ContactRequest[]
   disputes            Dispute[]
+  interactions        UserInteraction[]
 }
 
 model PortfolioItem {
@@ -142,10 +144,30 @@ model Dispute {
   resolvedBy  User?         @relation("DisputesResolved", fields: [resolvedById], references: [id])
 }
 
+model UserInteraction {
+  id         String          @id @default(cuid())
+  userId     String
+  workerId   String
+  type       InteractionType
+  createdAt  DateTime        @default(now())
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  worker     Worker          @relation(fields: [workerId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([workerId])
+}
+
 enum Role {
   user
   curator
   admin
+}
+
+enum InteractionType {
+  view
+  bookmark
+  tip
+  contact
 }
 
 enum DisputeStatus {

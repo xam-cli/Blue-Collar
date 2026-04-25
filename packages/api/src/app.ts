@@ -12,6 +12,7 @@ import workerRoutes from './routes/workers.js'
 import adminRoutes from './routes/admin.js'
 import userRoutes from './routes/users.js'
 import disputeRoutes from './routes/disputes.js'
+import recommendationRoutes from './routes/recommendations.js'
 
 const app = express()
 
@@ -31,6 +32,7 @@ app.use('/api/workers', workerRoutes)
 app.use('/api/admin', adminRoutes)
 app.use('/api/users', userRoutes)
 app.use('/api/disputes', disputeRoutes)
+app.use('/api/recommendations', recommendationRoutes)
 
 app.get('/health', async (_req, res) => {
   const checks: Record<string, { status: 'ok' | 'error'; latencyMs?: number; error?: string }> = {}
