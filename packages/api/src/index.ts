@@ -5,6 +5,9 @@ import passport from './config/passport.js'
 import authRoutes from './routes/auth.js'
 import categoryRoutes from './routes/categories.js'
 import workerRoutes from './routes/workers.js'
+import portfolioRoutes from './routes/portfolio.js'
+import reviewRoutes from './routes/reviews.js'
+import subscriptionRoutes from './routes/subscriptions.js'
 
 const app = express()
 const PORT = process.env.PORT || 3000
@@ -17,6 +20,9 @@ app.use(passport.initialize())
 app.use('/api/auth', authRoutes)
 app.use('/api/categories', categoryRoutes)
 app.use('/api/workers', workerRoutes)
+app.use('/api/workers/:workerId/portfolio', portfolioRoutes)
+app.use('/api/workers/:workerId/reviews', reviewRoutes)
+app.use('/api/subscriptions', subscriptionRoutes)
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'bluecollar-api' })

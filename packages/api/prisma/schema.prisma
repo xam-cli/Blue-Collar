@@ -31,6 +31,7 @@ model User {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
   workers       Worker[]
+  reviews       Review[]
 }
 
 model Category {
@@ -44,26 +45,82 @@ model Category {
 }
 
 model Worker {
-  id            String   @id @default(cuid())
+  id            String            @id @default(cuid())
   name          String
   bio           String?
   avatar        String?
   phone         String?
   email         String?
   walletAddress String?
-  isActive      Boolean  @default(true)
-  isVerified    Boolean  @default(false)
+  isActive      Boolean           @default(true)
+  isVerified    Boolean           @default(false)
   categoryId    String
-  category      Category @relation(fields: [categoryId], references: [id])
+  category      Category          @relation(fields: [categoryId], references: [id])
   curatorId     String
-  curator       User     @relation(fields: [curatorId], references: [id])
+  curator       User              @relation(fields: [curatorId], references: [id])
   locationId    String?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  latitude      Float?
+  longitude     Float?
+  portfolio     PortfolioItem[]
+  reviews       Review[]
+  subscription  Subscription?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+}
+
+model PortfolioItem {
+  id          String   @id @default(cuid())
+  workerId    String
+  worker      Worker   @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  imageUrl    String
+  description String?
+  order       Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Review {
+  id          String        @id @default(cuid())
+  workerId    String
+  worker      Worker        @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  authorId    String
+  author      User          @relation(fields: [authorId], references: [id])
+  rating      Int
+  comment     String?
+  status      ReviewStatus  @default(pending)
+  flagged     Boolean       @default(false)
+  flagReason  String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+}
+
+model Subscription {
+  id                 String             @id @default(cuid())
+  workerId           String             @unique
+  worker             Worker             @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  tier               SubscriptionTier   @default(free)
+  stripeCustomerId   String?
+  stripeSubId        String?
+  currentPeriodEnd   DateTime?
+  cancelAtPeriodEnd  Boolean            @default(false)
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
 }
 
 enum Role {
   user
   curator
   admin
+}
+
+enum ReviewStatus {
+  pending
+  approved
+  rejected
+}
+
+enum SubscriptionTier {
+  free
+  pro
+  premium
 }

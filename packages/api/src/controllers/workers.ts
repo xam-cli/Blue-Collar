@@ -18,7 +18,7 @@ export async function listWorkers(req: Request, res: Response) {
 export async function showWorker(req: Request, res: Response) {
   const worker = await db.worker.findUnique({
     where: { id: req.params.id },
-    include: { category: true },
+    include: { category: true, portfolio: { orderBy: { order: 'asc' } } },
   })
   if (!worker) return res.status(404).json({ status: 'error', message: 'Not found', code: 404 })
   return res.json({ data: worker, status: 'success', code: 200 })
