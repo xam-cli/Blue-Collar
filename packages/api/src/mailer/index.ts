@@ -151,3 +151,20 @@ export async function sendVerificationEmail(
     console.log('[mailer] Verification email (dev stub):', JSON.parse((info as any).message))
   }
 }
+
+export async function sendModerationEmail(
+  to: string,
+  firstName: string,
+  status: 'approved' | 'rejected',
+): Promise<void> {
+  const action = status === 'approved' ? 'approved' : 'rejected'
+  const info = await transporter.sendMail({
+    from: `"BlueCollar" <${process.env.MAIL_USER ?? 'noreply@bluecollar.app'}>`,
+    to,
+    subject: `Your review has been ${action}`,
+    html: `<p>Hi <strong>${firstName}</strong>, your review has been <strong>${action}</strong> by our moderation team.</p>`,
+  })
+  if ((transporter as any).options?.jsonTransport) {
+    console.log('[mailer] Moderation email (dev stub):', JSON.parse((info as any).message))
+  }
+}
