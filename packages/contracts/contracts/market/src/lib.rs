@@ -19,10 +19,25 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec};
 
 /// Maximum allowed protocol fee: 500 bps = 5%.
 pub const MAX_FEE_BPS: u32 = 500;
+
+// =============================================================================
+// Roles
+// =============================================================================
+
+/// Full admin — can grant/revoke any role.
+pub const ROLE_ADMIN: &str = "admin";
+/// May pause and unpause the contract.
+pub const ROLE_PAUSER: &str = "pauser";
+/// May update the protocol fee.
+pub const ROLE_FEE_MANAGER: &str = "fee_mgr";
+/// May resolve disputed milestones.
+pub const ROLE_DISPUTE_MGR: &str = "dispute_mgr";
+/// May upgrade the contract WASM.
+pub const ROLE_UPGRADER: &str = "upgrader";
 
 // =============================================================================
 // Types
@@ -60,13 +75,48 @@ pub struct Escrow {
     pub cancelled: bool,
 }
 
+/// Multi-signature escrow requiring `threshold` approvals before funds are released.
+///
+/// Any address in `signers` may call [`MarketContract::approve_multisig_release`].
+/// Once `approvals` reaches `threshold` the funds are automatically transferred to `to`.
+#[contracttype]
+#[derive(Clone)]
+pub struct MultiSigEscrow {
+    /// Address that funded the escrow.
+    pub from: Address,
+    /// Address that will receive funds once threshold is met.
+    pub to: Address,
+    /// Token contract address.
+    pub token: Address,
+    /// Locked amount.
+    pub amount: i128,
+    /// Unix timestamp after which `from` may cancel.
+    pub expiry: u64,
+    /// Ordered list of addresses authorised to approve release.
+    pub signers: Vec<Address>,
+    /// Number of approvals required to release funds.
+    pub threshold: u32,
+    /// Addresses that have already approved.
+    pub approvals: Vec<Address>,
+    /// `true` once funds have been released.
+    pub released: bool,
+    /// `true` once funds have been refunded.
+    pub cancelled: bool,
+}
+
 /// Storage keys used throughout the contract.
 #[contracttype]
 pub enum DataKey {
     /// Instance storage — [`Config`] struct, set once at [`MarketContract::initialize`].
     Config,
+    /// Instance storage — paused flag; when `true` all state-mutating functions revert.
+    Paused,
+    /// Persistent storage — `Vec<Address>` of members for a given role [`Symbol`].
+    RoleMembers(Symbol),
     /// Persistent storage — [`Escrow`] struct keyed by a caller-supplied id [`Symbol`].
     Escrow(Symbol),
+    /// Persistent storage — [`MultiSigEscrow`] keyed by a caller-supplied id [`Symbol`].
+    MultiSigEscrow(Symbol),
 }
 
 // =============================================================================
@@ -100,8 +150,14 @@ impl MarketContract {
             "Already initialized"
         );
         assert!(fee_bps <= MAX_FEE_BPS, "fee_bps exceeds maximum (500)");
-        let config = Config { admin, fee_bps, fee_recipient };
+        let config = Config { admin: admin.clone(), fee_bps, fee_recipient };
         env.storage().instance().set(&DataKey::Config, &config);
+        // Bootstrap: grant ROLE_ADMIN to the initial admin.
+        let role = Symbol::new(&env, ROLE_ADMIN);
+        let mut members: Vec<Address> = Vec::new(&env);
+        members.push_back(admin.clone());
+        env.storage().persistent().set(&DataKey::RoleMembers(role.clone()), &members);
+        env.events().publish((symbol_short!("RlGrnt"), role, admin), ());
     }
 
     // -------------------------------------------------------------------------
@@ -119,16 +175,172 @@ impl MarketContract {
     /// - `"Unauthorized"` if `admin` does not match the stored admin.
     /// - `"Not initialized"` if [`initialize`] has not been called.
     pub fn update_fee(env: Env, admin: Address, new_fee_bps: u32) {
-        admin.require_auth();
+        Self::require_role(&env, &Symbol::new(&env, ROLE_FEE_MANAGER), &admin);
         assert!(new_fee_bps <= MAX_FEE_BPS, "fee_bps exceeds maximum (500)");
         let mut config: Config = env
             .storage()
             .instance()
             .get(&DataKey::Config)
             .expect("Not initialized");
-        assert!(config.admin == admin, "Unauthorized");
         config.fee_bps = new_fee_bps;
         env.storage().instance().set(&DataKey::Config, &config);
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal RBAC helpers
+    // -------------------------------------------------------------------------
+
+    /// Return the member list for a role, or empty vec if no members exist.
+    fn get_role_members(env: &Env, role: &Symbol) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RoleMembers(role.clone()))
+            .unwrap_or(Vec::new(env))
+    }
+
+    /// Assert that `caller` holds `role` and has authorised this call.
+    ///
+    /// # Panics
+    /// Panics with `"Missing role"` if `caller` does not hold the role.
+    fn require_role(env: &Env, role: &Symbol, caller: &Address) {
+        caller.require_auth();
+        let members = Self::get_role_members(env, role);
+        assert!(members.iter().any(|m| m == *caller), "Missing role");
+    }
+
+    // -------------------------------------------------------------------------
+    // Role management (ROLE_ADMIN only)
+    // -------------------------------------------------------------------------
+
+    /// Grant a role to an address. Caller must hold [`ROLE_ADMIN`].
+    ///
+    /// Idempotent — granting an already-held role is a no-op.
+    ///
+    /// # Parameters
+    /// - `caller`: Must hold `ROLE_ADMIN`; `require_auth()` is enforced.
+    /// - `role`: The role symbol to grant.
+    /// - `account`: Address to receive the role.
+    ///
+    /// # Panics
+    /// - `"Missing role"` if `caller` does not hold `ROLE_ADMIN`.
+    /// - `"Contract is paused"` if paused.
+    ///
+    /// # Events
+    /// Emits `("RlGrnt", role, account)`.
+    pub fn grant_role(env: Env, caller: Address, role: Symbol, account: Address) {
+        let admin_role = Symbol::new(&env, ROLE_ADMIN);
+        Self::require_role(&env, &admin_role, &caller);
+        Self::require_not_paused(&env);
+
+        let mut members = Self::get_role_members(&env, &role);
+        if members.iter().all(|m| m != account) {
+            members.push_back(account.clone());
+            env.storage().persistent().set(&DataKey::RoleMembers(role.clone()), &members);
+        }
+
+        env.events().publish((symbol_short!("RlGrnt"), role, account), ());
+    }
+
+    /// Revoke a role from an address. Caller must hold [`ROLE_ADMIN`].
+    ///
+    /// # Parameters
+    /// - `caller`: Must hold `ROLE_ADMIN`; `require_auth()` is enforced.
+    /// - `role`: The role symbol to revoke.
+    /// - `account`: Address to lose the role.
+    ///
+    /// # Panics
+    /// - `"Missing role"` if `caller` does not hold `ROLE_ADMIN`.
+    /// - `"Account does not hold role"` if `account` is not a member.
+    /// - `"Contract is paused"` if paused.
+    ///
+    /// # Events
+    /// Emits `("RlRvkd", role, account)`.
+    pub fn revoke_role(env: Env, caller: Address, role: Symbol, account: Address) {
+        let admin_role = Symbol::new(&env, ROLE_ADMIN);
+        Self::require_role(&env, &admin_role, &caller);
+        Self::require_not_paused(&env);
+
+        let members = Self::get_role_members(&env, &role);
+        let mut updated: Vec<Address> = Vec::new(&env);
+        let mut found = false;
+        for m in members.iter() {
+            if m == account {
+                found = true;
+            } else {
+                updated.push_back(m);
+            }
+        }
+        assert!(found, "Account does not hold role");
+        env.storage().persistent().set(&DataKey::RoleMembers(role.clone()), &updated);
+
+        env.events().publish((symbol_short!("RlRvkd"), role, account), ());
+    }
+
+    /// Returns `true` if `account` holds `role`.
+    pub fn has_role(env: Env, role: Symbol, account: Address) -> bool {
+        Self::get_role_members(&env, &role).iter().any(|m| m == account)
+    }
+
+    /// Return all members of a role.
+    pub fn get_role_members_list(env: Env, role: Symbol) -> Vec<Address> {
+        Self::get_role_members(&env, &role)
+    }
+
+    // -------------------------------------------------------------------------
+    // Pause / Unpause (admin only)
+    // -------------------------------------------------------------------------
+
+    /// Assert that the contract is not paused.
+    ///
+    /// # Panics
+    /// Panics with `"Contract is paused"` if the paused flag is set.
+    fn require_not_paused(env: &Env) {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        assert!(!paused, "Contract is paused");
+    }
+
+    /// Pause the contract, blocking all state-mutating operations.
+    ///
+    /// # Parameters
+    /// - `admin`: Must hold [`ROLE_PAUSER`]; `require_auth()` is enforced.
+    ///
+    /// # Panics
+    /// - `"Missing role"` if `admin` does not hold `ROLE_PAUSER`.
+    ///
+    /// # Events
+    /// Emits `("Paused", admin)`.
+    pub fn pause(env: Env, admin: Address) {
+        Self::require_role(&env, &Symbol::new(&env, ROLE_PAUSER), &admin);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((symbol_short!("Paused"), admin), ());
+    }
+
+    /// Unpause the contract, re-enabling all state-mutating operations.
+    ///
+    /// # Parameters
+    /// - `admin`: Must hold [`ROLE_PAUSER`]; `require_auth()` is enforced.
+    ///
+    /// # Panics
+    /// - `"Missing role"` if `admin` does not hold `ROLE_PAUSER`.
+    ///
+    /// # Events
+    /// Emits `("Unpaused", admin)`.
+    pub fn unpause(env: Env, admin: Address) {
+        Self::require_role(&env, &Symbol::new(&env, ROLE_PAUSER), &admin);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((symbol_short!("Unpaused"), admin), ());
+    }
+
+    /// Returns `true` if the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     // -------------------------------------------------------------------------
@@ -154,6 +366,7 @@ impl MarketContract {
     /// Emits `("TipSent", from, to)` with data `(token_addr, amount)`.
     pub fn tip(env: Env, from: Address, to: Address, token_addr: Address, amount: i128) {
         from.require_auth();
+        Self::require_not_paused(&env);
         assert!(amount > 0, "Amount must be positive");
 
         let config: Config = env
@@ -210,6 +423,7 @@ impl MarketContract {
         expiry: u64,
     ) {
         from.require_auth();
+        Self::require_not_paused(&env);
         assert!(amount > 0, "Amount must be positive");
         assert!(
             !env.storage().persistent().has(&DataKey::Escrow(id.clone())),
@@ -255,6 +469,7 @@ impl MarketContract {
     /// Emits `("EscRel", id, escrow.to)` with data `escrow.amount`.
     pub fn release_escrow(env: Env, id: Symbol, caller: Address) {
         caller.require_auth();
+        Self::require_not_paused(&env);
         let mut escrow: Escrow = env
             .storage()
             .persistent()
@@ -300,6 +515,7 @@ impl MarketContract {
     /// Emits `("EscCnl", id, escrow.from)` with data `escrow.amount`.
     pub fn cancel_escrow(env: Env, id: Symbol, caller: Address) {
         caller.require_auth();
+        Self::require_not_paused(&env);
         let mut escrow: Escrow = env
             .storage()
             .persistent()
@@ -338,6 +554,169 @@ impl MarketContract {
     }
 
     // -------------------------------------------------------------------------
+    // Multi-sig escrow (#337)
+    // -------------------------------------------------------------------------
+
+    /// Create a multi-signature escrow requiring `threshold` approvals before release.
+    ///
+    /// Transfers `amount` tokens from `from` to the contract immediately.
+    ///
+    /// # Parameters
+    /// - `id`: Unique identifier for this multi-sig escrow.
+    /// - `from`: Payer; `require_auth()` is enforced.
+    /// - `to`: Worker that receives funds once threshold is met.
+    /// - `token_addr`: Stellar token contract address.
+    /// - `amount`: Amount to lock (must be > 0).
+    /// - `expiry`: Unix timestamp after which `from` may cancel.
+    /// - `signers`: Addresses authorised to approve release.
+    /// - `threshold`: Number of approvals required (1 ≤ threshold ≤ signers.len()).
+    ///
+    /// # Panics
+    /// - `"Amount must be positive"` if `amount <= 0`.
+    /// - `"MultiSigEscrow id already exists"` on duplicate id.
+    /// - `"Invalid threshold"` if threshold is 0 or exceeds signers count.
+    ///
+    /// # Events
+    /// Emits `("MsEscCrt", id, from)` with data `(to, amount, threshold)`.
+    pub fn create_multisig_escrow(
+        env: Env,
+        id: Symbol,
+        from: Address,
+        to: Address,
+        token_addr: Address,
+        amount: i128,
+        expiry: u64,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) {
+        from.require_auth();
+        assert!(amount > 0, "Amount must be positive");
+        assert!(
+            !env.storage().persistent().has(&DataKey::MultiSigEscrow(id.clone())),
+            "MultiSigEscrow id already exists"
+        );
+        assert!(
+            threshold > 0 && threshold <= signers.len(),
+            "Invalid threshold"
+        );
+
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&from, &env.current_contract_address(), &amount);
+
+        let escrow = MultiSigEscrow {
+            from: from.clone(),
+            to: to.clone(),
+            token: token_addr,
+            amount,
+            expiry,
+            signers,
+            threshold,
+            approvals: Vec::new(&env),
+            released: false,
+            cancelled: false,
+        };
+        env.storage().persistent().set(&DataKey::MultiSigEscrow(id.clone()), &escrow);
+
+        env.events().publish(
+            (symbol_short!("MsEscCrt"), id, from),
+            (to, amount, threshold),
+        );
+    }
+
+    /// Approve release of a multi-sig escrow. Funds are released automatically when
+    /// the approval count reaches `threshold`.
+    ///
+    /// # Parameters
+    /// - `id`: The multi-sig escrow identifier.
+    /// - `caller`: Must be in `signers`; `require_auth()` is enforced.
+    ///
+    /// # Panics
+    /// - `"MultiSigEscrow not found"` if no escrow exists with the given `id`.
+    /// - `"Not a signer"` if `caller` is not in the signers list.
+    /// - `"Already approved"` if `caller` has already approved.
+    /// - `"Already released"` / `"Escrow cancelled"` if escrow is finalised.
+    ///
+    /// # Events
+    /// Emits `("MsEscApv", id, caller)` with data `approvals_count`.
+    /// Emits `("MsEscRel", id, to)` with data `amount` when threshold is reached.
+    pub fn approve_multisig_release(env: Env, id: Symbol, caller: Address) {
+        caller.require_auth();
+        let mut escrow: MultiSigEscrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultiSigEscrow(id.clone()))
+            .expect("MultiSigEscrow not found");
+
+        assert!(!escrow.released, "Already released");
+        assert!(!escrow.cancelled, "Escrow cancelled");
+        assert!(
+            escrow.signers.iter().any(|s| s == caller),
+            "Not a signer"
+        );
+        assert!(
+            escrow.approvals.iter().all(|a| a != caller),
+            "Already approved"
+        );
+
+        escrow.approvals.push_back(caller.clone());
+        let count = escrow.approvals.len();
+
+        env.events().publish(
+            (symbol_short!("MsEscApv"), id.clone(), caller),
+            count,
+        );
+
+        if count >= escrow.threshold {
+            let client = token::Client::new(&env, &escrow.token);
+            client.transfer(&env.current_contract_address(), &escrow.to, &escrow.amount);
+            escrow.released = true;
+            env.events().publish(
+                (symbol_short!("MsEscRel"), id.clone(), escrow.to.clone()),
+                escrow.amount,
+            );
+        }
+
+        env.storage().persistent().set(&DataKey::MultiSigEscrow(id), &escrow);
+    }
+
+    /// Cancel a multi-sig escrow and refund the payer (after expiry, payer only).
+    ///
+    /// # Panics
+    /// - `"MultiSigEscrow not found"`, `"Not authorized"`, `"Already released"`,
+    ///   `"Already cancelled"`, `"Escrow not yet expired"`.
+    ///
+    /// # Events
+    /// Emits `("MsEscCnl", id, from)` with data `amount`.
+    pub fn cancel_multisig_escrow(env: Env, id: Symbol, caller: Address) {
+        caller.require_auth();
+        let mut escrow: MultiSigEscrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultiSigEscrow(id.clone()))
+            .expect("MultiSigEscrow not found");
+
+        assert!(escrow.from == caller, "Not authorized");
+        assert!(!escrow.released, "Already released");
+        assert!(!escrow.cancelled, "Already cancelled");
+        assert!(env.ledger().timestamp() >= escrow.expiry, "Escrow not yet expired");
+
+        let client = token::Client::new(&env, &escrow.token);
+        client.transfer(&env.current_contract_address(), &escrow.from, &escrow.amount);
+        escrow.cancelled = true;
+        env.storage().persistent().set(&DataKey::MultiSigEscrow(id.clone()), &escrow);
+
+        env.events().publish(
+            (symbol_short!("MsEscCnl"), id, escrow.from),
+            escrow.amount,
+        );
+    }
+
+    /// Fetch multi-sig escrow details by id.
+    pub fn get_multisig_escrow(env: Env, id: Symbol) -> Option<MultiSigEscrow> {
+        env.storage().persistent().get(&DataKey::MultiSigEscrow(id))
+    }
+
+    // -------------------------------------------------------------------------
     // Upgrade
     // -------------------------------------------------------------------------
 
@@ -351,13 +730,7 @@ impl MarketContract {
     /// - `"Not initialized"` if [`initialize`] has not been called.
     /// - `"Unauthorized"` if `admin` does not match the stored admin.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: soroban_sdk::BytesN<32>) {
-        admin.require_auth();
-        let config: Config = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config)
-            .expect("Not initialized");
-        assert!(config.admin == admin, "Unauthorized");
+        Self::require_role(&env, &Symbol::new(&env, ROLE_UPGRADER), &admin);
         env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 }
@@ -372,12 +745,13 @@ mod tests {
     use soroban_sdk::{
         testutils::{Address as _, Ledger, LedgerInfo},
         token::{Client as TokenClient, StellarAssetClient},
-        Address, Env, Symbol,
+        Address, Env, Symbol, Vec,
     };
 
     struct TestEnv {
         env: Env,
         contract_id: Address,
+        admin: Address,
         payer: Address,
         worker: Address,
         token_addr: Address,
@@ -397,8 +771,16 @@ mod tests {
             StellarAssetClient::new(&env, &token_addr).mint(&payer, &1_000_000);
 
             let contract_id = env.register_contract(None, MarketContract);
+            MarketContractClient::new(&env, &contract_id).initialize(&admin, &0, &admin);
 
-            TestEnv { env, contract_id, payer, worker, token_addr }
+            // Grant all operational roles to the bootstrap admin for convenience in tests.
+            let client = MarketContractClient::new(&env, &contract_id);
+            client.grant_role(&admin, &Symbol::new(&env, ROLE_PAUSER), &admin);
+            client.grant_role(&admin, &Symbol::new(&env, ROLE_FEE_MANAGER), &admin);
+            client.grant_role(&admin, &Symbol::new(&env, ROLE_DISPUTE_MGR), &admin);
+            client.grant_role(&admin, &Symbol::new(&env, ROLE_UPGRADER), &admin);
+
+            TestEnv { env, contract_id, admin, payer, worker, token_addr }
         }
 
         fn client(&self) -> MarketContractClient {
@@ -597,5 +979,71 @@ mod tests {
         let t = TestEnv::new();
         let id = Symbol::new(&t.env, "nope");
         assert!(t.client().get_escrow(&id).is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // Multi-sig escrow tests (#337)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_multisig_escrow_releases_at_threshold() {
+        let t = TestEnv::new();
+        let id = Symbol::new(&t.env, "ms1");
+        let s1 = Address::generate(&t.env);
+        let s2 = Address::generate(&t.env);
+        let signers = soroban_sdk::vec![&t.env, s1.clone(), s2.clone()];
+
+        t.client().create_multisig_escrow(&id, &t.payer, &t.worker, &t.token_addr, &200_000, &9999, &signers, &2);
+        assert_eq!(t.token_balance(&t.contract_id), 200_000);
+
+        t.client().approve_multisig_release(&id, &s1);
+        // not yet released
+        assert_eq!(t.token_balance(&t.worker), 0);
+
+        t.client().approve_multisig_release(&id, &s2);
+        // threshold reached
+        assert_eq!(t.token_balance(&t.worker), 200_000);
+        assert!(t.client().get_multisig_escrow(&id).unwrap().released);
+    }
+
+    #[test]
+    #[should_panic(expected = "Not a signer")]
+    fn test_multisig_approve_non_signer_panics() {
+        let t = TestEnv::new();
+        let id = Symbol::new(&t.env, "ms2");
+        let s1 = Address::generate(&t.env);
+        let signers = soroban_sdk::vec![&t.env, s1.clone()];
+        t.client().create_multisig_escrow(&id, &t.payer, &t.worker, &t.token_addr, &100_000, &9999, &signers, &1);
+        let stranger = Address::generate(&t.env);
+        t.client().approve_multisig_release(&id, &stranger);
+    }
+
+    #[test]
+    #[should_panic(expected = "Already approved")]
+    fn test_multisig_double_approve_panics() {
+        let t = TestEnv::new();
+        let id = Symbol::new(&t.env, "ms3");
+        let s1 = Address::generate(&t.env);
+        let s2 = Address::generate(&t.env);
+        let signers = soroban_sdk::vec![&t.env, s1.clone(), s2.clone()];
+        t.client().create_multisig_escrow(&id, &t.payer, &t.worker, &t.token_addr, &100_000, &9999, &signers, &2);
+        t.client().approve_multisig_release(&id, &s1);
+        t.client().approve_multisig_release(&id, &s1);
+    }
+
+    #[test]
+    fn test_multisig_cancel_after_expiry() {
+        let t = TestEnv::new();
+        let id = Symbol::new(&t.env, "ms4");
+        let s1 = Address::generate(&t.env);
+        let signers = soroban_sdk::vec![&t.env, s1.clone()];
+
+        t.set_time(1000);
+        t.client().create_multisig_escrow(&id, &t.payer, &t.worker, &t.token_addr, &100_000, &2000, &signers, &1);
+        t.set_time(3000);
+        t.client().cancel_multisig_escrow(&id, &t.payer);
+
+        assert_eq!(t.token_balance(&t.payer), 1_000_000);
+        assert!(t.client().get_multisig_escrow(&id).unwrap().cancelled);
     }
 }

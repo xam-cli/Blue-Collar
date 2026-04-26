@@ -20,7 +20,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, String,
+    Symbol, Vec,
 };
 
 /// Approximate TTL extension target (~1 year at 5 s/ledger).
@@ -58,19 +59,82 @@ pub struct Worker {
     /// Reputation score in basis points (0–10000, where 10000 = 100.00%).
     /// Updated by the admin via [`RegistryContract::update_reputation`].
     pub reputation: u32,
+    /// On-chain verified categories for this worker (see [`CategoryVerification`]).
+    pub verified_categories: Vec<Symbol>,
+    /// Total tokens staked by this worker for visibility boost.
+    pub staked_amount: i128,
 }
+
+/// On-chain record of a curator verifying a worker's category.
+#[contracttype]
+#[derive(Clone)]
+pub struct CategoryVerification {
+    /// The category that was verified.
+    pub category: Symbol,
+    /// Curator who performed the verification.
+    pub curator: Address,
+    /// Unix timestamp when this verification expires.
+    pub expires_at: u64,
+}
+
+/// Staking record for a worker.
+#[contracttype]
+#[derive(Clone)]
+pub struct StakeInfo {
+    /// Token contract used for staking.
+    pub token: Address,
+    /// Total amount currently staked.
+    pub amount: i128,
+    /// Ledger timestamp when unstake was requested (0 = no pending unstake).
+    pub unstake_requested_at: u64,
+    /// Accumulated rewards in basis points of staked amount per ledger.
+    pub rewards_accumulated: i128,
+    /// Ledger timestamp of last reward calculation.
+    pub last_reward_ledger: u64,
+}
+
+/// Result of a single registration attempt in [`RegistryContract::batch_register`].
+#[contracttype]
+#[derive(Clone)]
+pub struct BatchRegisterResult {
+    pub id: Symbol,
+    pub success: bool,
+}
+
+// =============================================================================
+// Roles
+// =============================================================================
+
+/// Full admin — can grant/revoke any role and call all privileged functions.
+pub const ROLE_ADMIN: &str = "admin";
+/// May pause and unpause the contract.
+pub const ROLE_PAUSER: &str = "pauser";
+/// May add and remove curators.
+pub const ROLE_CURATOR_MGR: &str = "curator_mgr";
+/// May update worker reputation scores.
+pub const ROLE_REP_MGR: &str = "rep_mgr";
+/// May upgrade the contract WASM.
+pub const ROLE_UPGRADER: &str = "upgrader";
 
 /// Storage keys used throughout the contract.
 #[contracttype]
 pub enum DataKey {
-    /// Instance storage — admin address, set once at [`RegistryContract::initialize`].
+    /// Instance storage — bootstrap admin address, set once at [`RegistryContract::initialize`].
     Admin,
+    /// Instance storage — paused flag; when `true` all state-mutating functions revert.
+    Paused,
+    /// Persistent storage — `Vec<Address>` of members for a given role [`Symbol`].
+    RoleMembers(Symbol),
     /// Persistent storage — ordered list of approved curator [`Address`]es.
     Curators,
     /// Persistent storage — [`Worker`] record keyed by its `id` [`Symbol`].
     Worker(Symbol),
     /// Persistent storage — ordered list of all registered worker id [`Symbol`]s.
     WorkerList,
+    /// Persistent storage — [`CategoryVerification`] keyed by `(worker_id, category)`.
+    CategoryVerification(Symbol, Symbol),
+    /// Persistent storage — [`StakeInfo`] keyed by worker id.
+    StakeInfo(Symbol),
 }
 
 // =============================================================================
@@ -88,6 +152,8 @@ impl RegistryContract {
 
     /// Initialise the contract and set the admin address.
     ///
+    /// Grants [`ROLE_ADMIN`] to `admin` automatically.
+    ///
     /// # Parameters
     /// - `admin`: The address that will have admin privileges.
     ///
@@ -99,19 +165,304 @@ impl RegistryContract {
             "Already initialized"
         );
         env.storage().instance().set(&DataKey::Admin, &admin);
+        // Bootstrap: grant ROLE_ADMIN to the initial admin.
+        let role = Symbol::new(&env, ROLE_ADMIN);
+        let mut members: Vec<Address> = Vec::new(&env);
+        members.push_back(admin.clone());
+        env.storage().persistent().set(&DataKey::RoleMembers(role.clone()), &members);
+        env.events().publish((symbol_short!("RlGrnt"), role, admin), ());
     }
 
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
 
-    /// Assert that `caller` is the admin and has authorised this call.
+    /// Return the member list for a role, or empty vec if no members exist.
+    fn get_role_members(env: &Env, role: &Symbol) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RoleMembers(role.clone()))
+            .unwrap_or(Vec::new(env))
+    }
+
+    /// Assert that `caller` holds `role` and has authorised this call.
     ///
     /// # Panics
-    /// Panics with `"Admin only"` if `caller` is not the stored admin.
-    fn require_admin(env: &Env, caller: &Address) {
+    /// Panics with `"Missing role"` if `caller` does not hold the role.
+    fn require_role(env: &Env, role: &Symbol, caller: &Address) {
         caller.require_auth();
-        assert!(*caller == Self::get_admin(env.clone()), "Admin only");
+        let members = Self::get_role_members(env, role);
+        assert!(members.iter().any(|m| m == *caller), "Missing role");
+    }
+
+    /// Assert that the contract is not paused.
+    ///
+    /// # Panics
+    /// Panics with `"Contract is paused"` if the paused flag is set.
+    fn require_not_paused(env: &Env) {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        assert!(!paused, "Contract is paused");
+    }
+
+    /// Return the delegate list for a worker, or empty vec if none exist.
+    fn get_delegates(env: &Env, worker_id: &Symbol) -> Vec<Delegate> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Delegates(worker_id.clone()))
+            .unwrap_or(Vec::new(env))
+    }
+
+    /// Assert that `caller` is either the worker's owner or an active (non-expired) delegate.
+    ///
+    /// # Panics
+    /// Panics with `"Not authorized"` if neither condition holds.
+    fn require_owner_or_delegate(env: &Env, worker: &Worker, caller: &Address) {
+        if worker.owner == *caller {
+            return;
+        }
+        let now = env.ledger().timestamp();
+        let delegates = Self::get_delegates(env, &worker.id);
+        let is_valid_delegate = delegates.iter().any(|d| {
+            d.address == *caller && (d.expires_at == 0 || d.expires_at > now)
+        });
+        assert!(is_valid_delegate, "Not authorized");
+    }
+
+    // -------------------------------------------------------------------------
+    // Role management (ROLE_ADMIN only)
+    // -------------------------------------------------------------------------
+
+    /// Grant a role to an address. Caller must hold [`ROLE_ADMIN`].
+    ///
+    /// Idempotent — granting an already-held role is a no-op.
+    ///
+    /// # Parameters
+    /// - `caller`: Must hold `ROLE_ADMIN`; `require_auth()` is enforced.
+    /// - `role`: The role symbol to grant (e.g. `Symbol::new(&env, "pauser")`).
+    /// - `account`: Address to receive the role.
+    ///
+    /// # Panics
+    /// - `"Missing role"` if `caller` does not hold `ROLE_ADMIN`.
+    /// - `"Contract is paused"` if paused.
+    ///
+    /// # Events
+    /// Emits `("RlGrnt", role, account)`.
+    pub fn grant_role(env: Env, caller: Address, role: Symbol, account: Address) {
+        let admin_role = Symbol::new(&env, ROLE_ADMIN);
+        Self::require_role(&env, &admin_role, &caller);
+        Self::require_not_paused(&env);
+
+        let mut members = Self::get_role_members(&env, &role);
+        if members.iter().all(|m| m != account) {
+            members.push_back(account.clone());
+            env.storage().persistent().set(&DataKey::RoleMembers(role.clone()), &members);
+        }
+
+        env.events().publish((symbol_short!("RlGrnt"), role, account), ());
+    }
+
+    /// Revoke a role from an address. Caller must hold [`ROLE_ADMIN`].
+    ///
+    /// # Parameters
+    /// - `caller`: Must hold `ROLE_ADMIN`; `require_auth()` is enforced.
+    /// - `role`: The role symbol to revoke.
+    /// - `account`: Address to lose the role.
+    ///
+    /// # Panics
+    /// - `"Missing role"` if `caller` does not hold `ROLE_ADMIN`.
+    /// - `"Account does not hold role"` if `account` is not a member.
+    /// - `"Contract is paused"` if paused.
+    ///
+    /// # Events
+    /// Emits `("RlRvkd", role, account)`.
+    pub fn revoke_role(env: Env, caller: Address, role: Symbol, account: Address) {
+        let admin_role = Symbol::new(&env, ROLE_ADMIN);
+        Self::require_role(&env, &admin_role, &caller);
+        Self::require_not_paused(&env);
+
+        let members = Self::get_role_members(&env, &role);
+        let mut updated: Vec<Address> = Vec::new(&env);
+        let mut found = false;
+        for m in members.iter() {
+            if m == account {
+                found = true;
+            } else {
+                updated.push_back(m);
+            }
+        }
+        assert!(found, "Account does not hold role");
+        env.storage().persistent().set(&DataKey::RoleMembers(role.clone()), &updated);
+
+        env.events().publish((symbol_short!("RlRvkd"), role, account), ());
+    }
+
+    /// Returns `true` if `account` holds `role`.
+    pub fn has_role(env: Env, role: Symbol, account: Address) -> bool {
+        Self::get_role_members(&env, &role).iter().any(|m| m == account)
+    }
+
+    /// Return all members of a role.
+    pub fn get_role_members_list(env: Env, role: Symbol) -> Vec<Address> {
+        Self::get_role_members(&env, &role)
+    }
+
+    // -------------------------------------------------------------------------
+    // Delegation management
+    // -------------------------------------------------------------------------
+
+    /// Add a delegate for a worker profile. Owner only.
+    ///
+    /// Idempotent — adding an existing delegate updates its expiry.
+    ///
+    /// # Parameters
+    /// - `id`: The worker's unique identifier.
+    /// - `owner`: Must be the worker's owner; `require_auth()` is enforced.
+    /// - `delegate`: Address to grant delegation to.
+    /// - `expires_at`: Unix timestamp when the delegation expires. Pass `0` for no expiry.
+    ///
+    /// # Panics
+    /// - `"Worker not found"` if no worker exists with the given `id`.
+    /// - `"Not authorized"` if `owner` is not the worker's owner.
+    /// - `"Contract is paused"` if paused.
+    ///
+    /// # Events
+    /// Emits `("DlgAdd", id, delegate)` with data `expires_at`.
+    pub fn add_delegate(env: Env, id: Symbol, owner: Address, delegate: Address, expires_at: u64) {
+        owner.require_auth();
+        Self::require_not_paused(&env);
+
+        let worker: Worker = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Worker(id.clone()))
+            .expect("Worker not found");
+        assert!(worker.owner == owner, "Not authorized");
+
+        let mut delegates = Self::get_delegates(&env, &id);
+
+        // Update expiry if delegate already exists, otherwise push.
+        let mut found = false;
+        for i in 0..delegates.len() {
+            let mut d = delegates.get(i).unwrap();
+            if d.address == delegate {
+                d.expires_at = expires_at;
+                delegates.set(i, d);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            delegates.push_back(Delegate { address: delegate.clone(), expires_at });
+        }
+
+        env.storage().persistent().set(&DataKey::Delegates(id.clone()), &delegates);
+
+        env.events().publish(
+            (symbol_short!("DlgAdd"), id, delegate),
+            expires_at,
+        );
+    }
+
+    /// Remove a delegate from a worker profile. Owner only.
+    ///
+    /// # Parameters
+    /// - `id`: The worker's unique identifier.
+    /// - `owner`: Must be the worker's owner; `require_auth()` is enforced.
+    /// - `delegate`: Address to revoke delegation from.
+    ///
+    /// # Panics
+    /// - `"Worker not found"` if no worker exists with the given `id`.
+    /// - `"Not authorized"` if `owner` is not the worker's owner.
+    /// - `"Delegate not found"` if `delegate` is not in the list.
+    /// - `"Contract is paused"` if paused.
+    ///
+    /// # Events
+    /// Emits `("DlgRem", id, delegate)`.
+    pub fn remove_delegate(env: Env, id: Symbol, owner: Address, delegate: Address) {
+        owner.require_auth();
+        Self::require_not_paused(&env);
+
+        let worker: Worker = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Worker(id.clone()))
+            .expect("Worker not found");
+        assert!(worker.owner == owner, "Not authorized");
+
+        let delegates = Self::get_delegates(&env, &id);
+        let mut updated: Vec<Delegate> = Vec::new(&env);
+        let mut removed = false;
+        for d in delegates.iter() {
+            if d.address == delegate {
+                removed = true;
+            } else {
+                updated.push_back(d);
+            }
+        }
+        assert!(removed, "Delegate not found");
+
+        env.storage().persistent().set(&DataKey::Delegates(id.clone()), &updated);
+
+        env.events().publish(
+            (symbol_short!("DlgRem"), id, delegate),
+            (),
+        );
+    }
+
+    /// Get all delegates for a worker.
+    ///
+    /// # Returns
+    /// A `Vec<Delegate>` (may be empty).
+    pub fn get_worker_delegates(env: Env, id: Symbol) -> Vec<Delegate> {
+        Self::get_delegates(&env, &id)
+    }
+
+    // -------------------------------------------------------------------------
+    // Pause / Unpause (admin only)
+    // -------------------------------------------------------------------------
+
+    /// Pause the contract, blocking all state-mutating operations.
+    ///
+    /// # Parameters
+    /// - `admin`: Must hold [`ROLE_PAUSER`]; `require_auth()` is enforced.
+    ///
+    /// # Panics
+    /// Panics with `"Missing role"` if `admin` does not hold `ROLE_PAUSER`.
+    ///
+    /// # Events
+    /// Emits `("Paused", admin)`.
+    pub fn pause(env: Env, admin: Address) {
+        Self::require_role(&env, &Symbol::new(&env, ROLE_PAUSER), &admin);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((symbol_short!("Paused"), admin), ());
+    }
+
+    /// Unpause the contract, re-enabling all state-mutating operations.
+    ///
+    /// # Parameters
+    /// - `admin`: Must hold [`ROLE_PAUSER`]; `require_auth()` is enforced.
+    ///
+    /// # Panics
+    /// Panics with `"Missing role"` if `admin` does not hold `ROLE_PAUSER`.
+    ///
+    /// # Events
+    /// Emits `("Unpaused", admin)`.
+    pub fn unpause(env: Env, admin: Address) {
+        Self::require_role(&env, &Symbol::new(&env, ROLE_PAUSER), &admin);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((symbol_short!("Unpaused"), admin), ());
+    }
+
+    /// Returns `true` if the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Return the current curator list, or an empty vec if none have been added yet.
@@ -138,7 +489,8 @@ impl RegistryContract {
     /// # Events
     /// Emits `("CurAdd", admin, curator)`.
     pub fn add_curator(env: Env, admin: Address, curator: Address) {
-        Self::require_admin(&env, &admin);
+        Self::require_role(&env, &Symbol::new(&env, ROLE_CURATOR_MGR), &admin);
+        Self::require_not_paused(&env);
 
         let mut curators = Self::get_curators(&env);
         if curators.iter().all(|c| c != curator) {
@@ -161,7 +513,8 @@ impl RegistryContract {
     /// # Events
     /// Emits `("CurRem", admin, curator)`.
     pub fn remove_curator(env: Env, admin: Address, curator: Address) {
-        Self::require_admin(&env, &admin);
+        Self::require_role(&env, &Symbol::new(&env, ROLE_CURATOR_MGR), &admin);
+        Self::require_not_paused(&env);
 
         let curators = Self::get_curators(&env);
         let mut updated: Vec<Address> = Vec::new(&env);
@@ -217,6 +570,7 @@ impl RegistryContract {
         curator: Address,
     ) {
         curator.require_auth();
+        Self::require_not_paused(&env);
         assert!(
             Self::get_curators(&env).iter().any(|c| c == curator),
             "Caller is not a curator"
@@ -232,6 +586,8 @@ impl RegistryContract {
             location_hash,
             contact_hash,
             reputation: 0,
+            verified_categories: Vec::new(&env),
+            staked_amount: 0,
         };
 
         let key = DataKey::Worker(id.clone());
@@ -272,12 +628,13 @@ impl RegistryContract {
     /// Emits `("WrkTgl", id)` with data `new_is_active: bool`.
     pub fn toggle(env: Env, id: Symbol, caller: Address) {
         caller.require_auth();
+        Self::require_not_paused(&env);
         let mut worker: Worker = env
             .storage()
             .persistent()
             .get(&DataKey::Worker(id.clone()))
             .expect("Worker not found");
-        assert!(worker.owner == caller, "Not authorized");
+        Self::require_owner_or_delegate(&env, &worker, &caller);
         worker.is_active = !worker.is_active;
         let new_status = worker.is_active;
         env.storage().persistent().set(&DataKey::Worker(id.clone()), &worker);
@@ -313,12 +670,13 @@ impl RegistryContract {
         contact_hash: BytesN<32>,
     ) {
         caller.require_auth();
+        Self::require_not_paused(&env);
         let mut worker: Worker = env
             .storage()
             .persistent()
             .get(&DataKey::Worker(id.clone()))
             .expect("Worker not found");
-        assert!(worker.owner == caller, "Not authorized");
+        Self::require_owner_or_delegate(&env, &worker, &caller);
 
         worker.name = name.clone();
         worker.category = category.clone();
@@ -357,6 +715,7 @@ impl RegistryContract {
         wallet: Address,
     ) {
         caller.require_auth();
+        Self::require_not_paused(&env);
 
         let mut worker: Worker = env
             .storage()
@@ -364,7 +723,7 @@ impl RegistryContract {
             .get(&DataKey::Worker(id.clone()))
             .expect("Worker not found");
 
-        assert!(worker.owner == caller, "Not authorized");
+        Self::require_owner_or_delegate(&env, &worker, &caller);
 
         worker.name = name.clone();
         worker.category = category.clone();
@@ -393,6 +752,7 @@ impl RegistryContract {
     /// Emits `("WrkDrg", id, caller)`.
     pub fn deregister(env: Env, id: Symbol, caller: Address) {
         caller.require_auth();
+        Self::require_not_paused(&env);
         let worker: Worker = env
             .storage()
             .persistent()
@@ -517,7 +877,8 @@ impl RegistryContract {
     /// # Events
     /// Emits `("RepUpd", id)` with data `score`.
     pub fn update_reputation(env: Env, admin: Address, id: Symbol, score: u32) {
-        Self::require_admin(&env, &admin);
+        Self::require_role(&env, &Symbol::new(&env, ROLE_REP_MGR), &admin);
+        Self::require_not_paused(&env);
         assert!(score <= 10_000, "Score out of range");
 
         let mut worker: Worker = env
@@ -533,6 +894,322 @@ impl RegistryContract {
     }
 
     // -------------------------------------------------------------------------
+    // Category verification (#338)
+    // -------------------------------------------------------------------------
+
+    /// Verify a worker's category on-chain. Curator only.
+    ///
+    /// Adds `category` to the worker's `verified_categories` list (idempotent) and
+    /// stores a [`CategoryVerification`] record with expiry and curator info.
+    ///
+    /// # Panics
+    /// - `"Caller is not a curator"` / `"Worker not found"`.
+    ///
+    /// # Events
+    /// Emits `("CatVfy", worker_id, category)` with data `(curator, expires_at)`.
+    pub fn verify_category(
+        env: Env,
+        curator: Address,
+        worker_id: Symbol,
+        category: Symbol,
+        expires_at: u64,
+    ) {
+        curator.require_auth();
+        assert!(
+            Self::get_curators(&env).iter().any(|c| c == curator),
+            "Caller is not a curator"
+        );
+
+        let mut worker: Worker = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Worker(worker_id.clone()))
+            .expect("Worker not found");
+
+        if worker.verified_categories.iter().all(|c| c != category) {
+            worker.verified_categories.push_back(category.clone());
+            env.storage().persistent().set(&DataKey::Worker(worker_id.clone()), &worker);
+        }
+
+        let verification = CategoryVerification {
+            category: category.clone(),
+            curator: curator.clone(),
+            expires_at,
+        };
+        env.storage().persistent().set(
+            &DataKey::CategoryVerification(worker_id.clone(), category.clone()),
+            &verification,
+        );
+
+        env.events().publish(
+            (symbol_short!("CatVfy"), worker_id, category),
+            (curator, expires_at),
+        );
+    }
+
+    /// Get the verification record for a specific worker + category pair.
+    pub fn get_category_verification(
+        env: Env,
+        worker_id: Symbol,
+        category: Symbol,
+    ) -> Option<CategoryVerification> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CategoryVerification(worker_id, category))
+    }
+
+    // -------------------------------------------------------------------------
+    // Batch registration (#340)
+    // -------------------------------------------------------------------------
+
+    /// Maximum number of workers that can be registered in a single batch call.
+    pub const MAX_BATCH_SIZE: u32 = 20;
+
+    /// Register multiple workers in one transaction. Curator only.
+    ///
+    /// Processes up to [`MAX_BATCH_SIZE`] entries. Duplicate ids are skipped
+    /// (partial success) rather than aborting the whole batch.
+    ///
+    /// # Panics
+    /// - `"Caller is not a curator"` / `"Batch too large"` / `"Mismatched input lengths"`.
+    ///
+    /// # Returns
+    /// A [`Vec<BatchRegisterResult>`] with one entry per input.
+    pub fn batch_register(
+        env: Env,
+        curator: Address,
+        ids: Vec<Symbol>,
+        owners: Vec<Address>,
+        names: Vec<String>,
+        categories: Vec<Symbol>,
+        location_hashes: Vec<BytesN<32>>,
+        contact_hashes: Vec<BytesN<32>>,
+    ) -> Vec<BatchRegisterResult> {
+        curator.require_auth();
+        assert!(
+            Self::get_curators(&env).iter().any(|c| c == curator),
+            "Caller is not a curator"
+        );
+
+        let n = ids.len();
+        assert!(n <= Self::MAX_BATCH_SIZE, "Batch too large");
+        assert!(
+            owners.len() == n
+                && names.len() == n
+                && categories.len() == n
+                && location_hashes.len() == n
+                && contact_hashes.len() == n,
+            "Mismatched input lengths"
+        );
+
+        let mut results: Vec<BatchRegisterResult> = Vec::new(&env);
+        let list_key = DataKey::WorkerList;
+        let mut list: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&list_key)
+            .unwrap_or(Vec::new(&env));
+
+        for i in 0..n {
+            let id = ids.get(i).unwrap();
+            let key = DataKey::Worker(id.clone());
+
+            if env.storage().persistent().has(&key) {
+                results.push_back(BatchRegisterResult { id, success: false });
+                continue;
+            }
+
+            let owner = owners.get(i).unwrap();
+            let worker = Worker {
+                id: id.clone(),
+                owner: owner.clone(),
+                name: names.get(i).unwrap(),
+                category: categories.get(i).unwrap(),
+                is_active: true,
+                wallet: owner.clone(),
+                location_hash: location_hashes.get(i).unwrap(),
+                contact_hash: contact_hashes.get(i).unwrap(),
+                reputation: 0,
+                verified_categories: Vec::new(&env),
+                staked_amount: 0,
+            };
+
+            env.storage().persistent().set(&key, &worker);
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            list.push_back(id.clone());
+
+            env.events().publish(
+                (symbol_short!("WrkReg"), id.clone()),
+                (owner, categories.get(i).unwrap()),
+            );
+
+            results.push_back(BatchRegisterResult { id, success: true });
+        }
+
+        env.storage().persistent().set(&list_key, &list);
+        env.storage().persistent().extend_ttl(&list_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        results
+    }
+
+    // -------------------------------------------------------------------------
+    // Worker staking (#341)
+    // -------------------------------------------------------------------------
+
+    /// Cooldown period in seconds before an unstake request can be finalised (~7 days).
+    pub const UNSTAKE_COOLDOWN_SECS: u64 = 604_800;
+    /// Reward rate: 1 basis point per 1000 seconds of staking.
+    pub const REWARD_RATE_BPS_PER_1000_SECS: i128 = 1;
+
+    /// Stake tokens for a worker to boost visibility.
+    ///
+    /// Transfers `amount` tokens from `caller` to the contract.
+    ///
+    /// # Panics
+    /// - `"Worker not found"` / `"Not authorized"` / `"Amount must be positive"`.
+    ///
+    /// # Events
+    /// Emits `("Staked", worker_id, caller)` with data `(amount, total_staked)`.
+    pub fn stake(env: Env, caller: Address, worker_id: Symbol, token_addr: Address, amount: i128) {
+        caller.require_auth();
+        assert!(amount > 0, "Amount must be positive");
+
+        let mut worker: Worker = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Worker(worker_id.clone()))
+            .expect("Worker not found");
+        assert!(worker.owner == caller, "Not authorized");
+
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&caller, &env.current_contract_address(), &amount);
+
+        let now = env.ledger().timestamp();
+        let mut info: StakeInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeInfo(worker_id.clone()))
+            .unwrap_or(StakeInfo {
+                token: token_addr.clone(),
+                amount: 0,
+                unstake_requested_at: 0,
+                rewards_accumulated: 0,
+                last_reward_ledger: now,
+            });
+
+        let elapsed = now.saturating_sub(info.last_reward_ledger);
+        info.rewards_accumulated +=
+            info.amount * Self::REWARD_RATE_BPS_PER_1000_SECS * elapsed as i128 / 1000;
+        info.last_reward_ledger = now;
+        info.amount += amount;
+        info.unstake_requested_at = 0;
+        env.storage().persistent().set(&DataKey::StakeInfo(worker_id.clone()), &info);
+
+        worker.staked_amount = info.amount;
+        env.storage().persistent().set(&DataKey::Worker(worker_id.clone()), &worker);
+
+        env.events().publish(
+            (symbol_short!("Staked"), worker_id, caller),
+            (amount, info.amount),
+        );
+    }
+
+    /// Request an unstake. Starts the cooldown timer.
+    ///
+    /// # Panics
+    /// - `"Worker not found"` / `"Not authorized"` / `"No active stake"` /
+    ///   `"Unstake already requested"`.
+    ///
+    /// # Events
+    /// Emits `("UnstakeRq", worker_id, caller)` with data `unstake_requested_at`.
+    pub fn request_unstake(env: Env, caller: Address, worker_id: Symbol) {
+        caller.require_auth();
+        let worker: Worker = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Worker(worker_id.clone()))
+            .expect("Worker not found");
+        assert!(worker.owner == caller, "Not authorized");
+
+        let mut info: StakeInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeInfo(worker_id.clone()))
+            .expect("No active stake");
+        assert!(info.amount > 0, "No active stake");
+        assert!(info.unstake_requested_at == 0, "Unstake already requested");
+
+        let now = env.ledger().timestamp();
+        info.unstake_requested_at = now;
+        env.storage().persistent().set(&DataKey::StakeInfo(worker_id.clone()), &info);
+
+        env.events().publish(
+            (symbol_short!("UnstakeRq"), worker_id, caller),
+            now,
+        );
+    }
+
+    /// Finalise unstake after cooldown. Returns staked tokens + rewards to caller.
+    ///
+    /// # Panics
+    /// - `"Worker not found"` / `"Not authorized"` / `"No active stake"` /
+    ///   `"Unstake not requested"` / `"Cooldown not elapsed"`.
+    ///
+    /// # Events
+    /// Emits `("Unstaked", worker_id, caller)` with data `(staked, rewards)`.
+    pub fn unstake(env: Env, caller: Address, worker_id: Symbol) {
+        caller.require_auth();
+        let mut worker: Worker = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Worker(worker_id.clone()))
+            .expect("Worker not found");
+        assert!(worker.owner == caller, "Not authorized");
+
+        let mut info: StakeInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeInfo(worker_id.clone()))
+            .expect("No active stake");
+        assert!(info.amount > 0, "No active stake");
+        assert!(info.unstake_requested_at > 0, "Unstake not requested");
+
+        let now = env.ledger().timestamp();
+        assert!(
+            now >= info.unstake_requested_at + Self::UNSTAKE_COOLDOWN_SECS,
+            "Cooldown not elapsed"
+        );
+
+        let elapsed = now.saturating_sub(info.last_reward_ledger);
+        info.rewards_accumulated +=
+            info.amount * Self::REWARD_RATE_BPS_PER_1000_SECS * elapsed as i128 / 1000;
+
+        let total_return = info.amount + info.rewards_accumulated;
+        let client = token::Client::new(&env, &info.token);
+        client.transfer(&env.current_contract_address(), &caller, &total_return);
+
+        let staked = info.amount;
+        let rewards = info.rewards_accumulated;
+        info.amount = 0;
+        info.rewards_accumulated = 0;
+        info.unstake_requested_at = 0;
+        env.storage().persistent().set(&DataKey::StakeInfo(worker_id.clone()), &info);
+
+        worker.staked_amount = 0;
+        env.storage().persistent().set(&DataKey::Worker(worker_id.clone()), &worker);
+
+        env.events().publish(
+            (symbol_short!("Unstaked"), worker_id, caller),
+            (staked, rewards),
+        );
+    }
+
+    /// Get staking info for a worker.
+    pub fn get_stake_info(env: Env, worker_id: Symbol) -> Option<StakeInfo> {
+        env.storage().persistent().get(&DataKey::StakeInfo(worker_id))
+    }
+
+    // -------------------------------------------------------------------------
     // Upgrade
     // -------------------------------------------------------------------------
 
@@ -545,8 +1222,7 @@ impl RegistryContract {
     /// # Panics
     /// Panics with `"Admin only"` if `admin` is not the stored admin.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
-        admin.require_auth();
-        assert!(admin == Self::get_admin(env.clone()), "Admin only");
+        Self::require_role(&env, &Symbol::new(&env, ROLE_UPGRADER), &admin);
         env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 }
@@ -558,7 +1234,7 @@ impl RegistryContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String, Symbol};
+    use soroban_sdk::{testutils::{Address as _, Ledger, LedgerInfo}, Address, BytesN, Env, String, Symbol};
 
     struct TestEnv {
         env: Env,
@@ -580,6 +1256,12 @@ mod tests {
             let contract_id = env.register_contract(None, RegistryContract);
             let client = RegistryContractClient::new(&env, &contract_id);
             client.initialize(&admin);
+
+            // Grant all operational roles to the bootstrap admin for convenience in tests.
+            client.grant_role(&admin, &Symbol::new(&env, ROLE_PAUSER), &admin);
+            client.grant_role(&admin, &Symbol::new(&env, ROLE_CURATOR_MGR), &admin);
+            client.grant_role(&admin, &Symbol::new(&env, ROLE_REP_MGR), &admin);
+            client.grant_role(&admin, &Symbol::new(&env, ROLE_UPGRADER), &admin);
 
             TestEnv { env, contract_id, admin, curator, owner }
         }
@@ -639,7 +1321,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Admin only")]
+    #[should_panic(expected = "Missing role")]
     fn test_add_curator_non_admin_panics() {
         let t = TestEnv::new();
         let stranger = Address::generate(&t.env);
@@ -780,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Admin only")]
+    #[should_panic(expected = "Missing role")]
     fn test_update_reputation_non_admin_panics() {
         let t = TestEnv::new();
         t.client().add_curator(&t.admin, &t.curator);
@@ -810,5 +1492,252 @@ mod tests {
 
         let page2 = t.client().list_workers_paginated(&3, &3);
         assert_eq!(page2.len(), 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // Category verification tests (#338)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_verify_category_stores_record() {
+        let t = TestEnv::new();
+        t.client().add_curator(&t.admin, &t.curator);
+        t.register_worker(&t.curator);
+
+
+      let cat = Symbol::new(&t.env, "plumber");
+        t.client().verify_category(&t.curator, &t.worker_id(), &cat, &9999);
+
+        let v = t.client().get_category_verification(&t.worker_id(), &cat).unwrap();
+        assert_eq!(v.curator, t.curator);
+        assert_eq!(v.expires_at, 9999);
+
+        let worker = t.client().get_worker(&t.worker_id()).unwrap();
+        assert_eq!(worker.verified_categories.len(), 1);
+    }
+
+    #[test]
+    fn test_verify_category_idempotent() {
+        let t = TestEnv::new();
+        t.client().add_curator(&t.admin, &t.curator);
+        t.register_worker(&t.curator);
+
+        let cat = Symbol::new(&t.env, "plumber");
+        t.client().verify_category(&t.curator, &t.worker_id(), &cat, &9999);
+        t.client().verify_category(&t.curator, &t.worker_id(), &cat, &9999);
+
+        let worker = t.client().get_worker(&t.worker_id()).unwrap();
+        assert_eq!(worker.verified_categories.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Caller is not a curator")]
+    fn test_verify_category_non_curator_panics() {
+        let t = TestEnv::new();
+        t.client().add_curator(&t.admin, &t.curator);
+        t.register_worker(&t.curator);
+        let stranger = Address::generate(&t.env);
+        t.client().verify_category(&stranger, &t.worker_id(), &Symbol::new(&t.env, "plumber"), &9999);
+    }
+
+    // -------------------------------------------------------------------------
+    // Batch registration tests (#340)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_batch_register_all_succeed() {
+        let t = TestEnv::new();
+        t.client().add_curator(&t.admin, &t.curator);
+
+        let ids = soroban_sdk::vec![
+            &t.env,
+            Symbol::new(&t.env, "b1"),
+            Symbol::new(&t.env, "b2"),
+        ];
+        let owners = soroban_sdk::vec![&t.env, t.owner.clone(), t.owner.clone()];
+        let names = soroban_sdk::vec![
+            &t.env,
+            String::from_str(&t.env, "Alice"),
+            String::from_str(&t.env, "Bob"),
+        ];
+        let cats = soroban_sdk::vec![
+            &t.env,
+            Symbol::new(&t.env, "plumber"),
+            Symbol::new(&t.env, "welder"),
+        ];
+        let hashes = soroban_sdk::vec![&t.env, t.zero_hash(), t.zero_hash()];
+
+        let results = t.client().batch_register(
+            &t.curator, &ids, &owners, &names, &cats, &hashes, &hashes,
+        );
+
+        assert_eq!(results.len(), 2);
+        assert!(results.get(0).unwrap().success);
+        assert!(results.get(1).unwrap().success);
+        assert_eq!(t.client().worker_count(), 2);
+    }
+
+    #[test]
+    fn test_batch_register_partial_success_on_duplicate() {
+        let t = TestEnv::new();
+        t.client().add_curator(&t.admin, &t.curator);
+        t.register_worker(&t.curator); // registers "worker1"
+
+        let ids = soroban_sdk::vec![
+            &t.env,
+            t.worker_id(), // duplicate
+            Symbol::new(&t.env, "b2"),
+        ];
+        let owners = soroban_sdk::vec![&t.env, t.owner.clone(), t.owner.clone()];
+        let names = soroban_sdk::vec![
+            &t.env,
+            String::from_str(&t.env, "Alice"),
+            String::from_str(&t.env, "Bob"),
+        ];
+        let cats = soroban_sdk::vec![
+            &t.env,
+            Symbol::new(&t.env, "plumber"),
+            Symbol::new(&t.env, "welder"),
+        ];
+        let hashes = soroban_sdk::vec![&t.env, t.zero_hash(), t.zero_hash()];
+
+        let results = t.client().batch_register(
+            &t.curator, &ids, &owners, &names, &cats, &hashes, &hashes,
+        );
+
+        assert!(!results.get(0).unwrap().success); // duplicate
+        assert!(results.get(1).unwrap().success);
+        assert_eq!(t.client().worker_count(), 2); // original + b2
+    }
+
+    #[test]
+    #[should_panic(expected = "Batch too large")]
+    fn test_batch_register_too_large_panics() {
+        let t = TestEnv::new();
+        t.client().add_curator(&t.admin, &t.curator);
+
+        let mut ids = Vec::new(&t.env);
+        let mut owners = Vec::new(&t.env);
+        let mut names = Vec::new(&t.env);
+        let mut cats = Vec::new(&t.env);
+        let mut hashes = Vec::new(&t.env);
+
+        for i in 0..21u32 {
+            let id_str = soroban_sdk::String::from_str(&t.env, &format!("w{i}"));
+            ids.push_back(Symbol::new(&t.env, &id_str));
+            owners.push_back(t.owner.clone());
+            names.push_back(String::from_str(&t.env, "W"));
+            cats.push_back(Symbol::new(&t.env, "plumber"));
+            hashes.push_back(t.zero_hash());
+        }
+
+        t.client().batch_register(&t.curator, &ids, &owners, &names, &cats, &hashes, &hashes);
+    }
+
+    // -------------------------------------------------------------------------
+    // Staking tests (#341)
+    // -------------------------------------------------------------------------
+
+    struct StakeTestEnv {
+        base: TestEnv,
+        token_addr: Address,
+    }
+
+    impl StakeTestEnv {
+        fn new() -> Self {
+            use soroban_sdk::token::StellarAssetClient;
+            let base = TestEnv::new();
+            let admin = base.admin.clone();
+            let token_id = base.env.register_stellar_asset_contract_v2(admin.clone());
+            let token_addr = token_id.address();
+            StellarAssetClient::new(&base.env, &token_addr).mint(&base.owner, &1_000_000);
+            // Mint to contract for reward payouts
+            StellarAssetClient::new(&base.env, &token_addr)
+                .mint(&base.contract_id, &1_000_000);
+            StakeTestEnv { base, token_addr }
+        }
+
+        fn set_time(&self, ts: u64) {
+            use soroban_sdk::testutils::{Ledger, LedgerInfo};
+            self.base.env.ledger().set(LedgerInfo {
+                timestamp: ts,
+                protocol_version: 22,
+                sequence_number: 1,
+                network_id: Default::default(),
+                base_reserve: 10,
+                min_temp_entry_ttl: 1,
+                min_persistent_entry_ttl: 1,
+                max_entry_ttl: 100_000,
+            });
+        }
+
+        fn token_balance(&self, addr: &Address) -> i128 {
+            soroban_sdk::token::Client::new(&self.base.env, &self.token_addr).balance(addr)
+        }
+    }
+
+    #[test]
+    fn test_stake_increases_staked_amount() {
+        let s = StakeTestEnv::new();
+        s.base.client().add_curator(&s.base.admin, &s.base.curator);
+        s.base.register_worker(&s.base.curator);
+
+        s.set_time(1000);
+        s.base.client().stake(&s.base.owner, &s.base.worker_id(), &s.token_addr, &500_000);
+
+        let info = s.base.client().get_stake_info(&s.base.worker_id()).unwrap();
+        assert_eq!(info.amount, 500_000);
+
+        let worker = s.base.client().get_worker(&s.base.worker_id()).unwrap();
+        assert_eq!(worker.staked_amount, 500_000);
+    }
+
+    #[test]
+    fn test_unstake_after_cooldown_returns_tokens() {
+        let s = StakeTestEnv::new();
+        s.base.client().add_curator(&s.base.admin, &s.base.curator);
+        s.base.register_worker(&s.base.curator);
+
+        s.set_time(1000);
+        s.base.client().stake(&s.base.owner, &s.base.worker_id(), &s.token_addr, &500_000);
+
+        s.set_time(2000);
+        s.base.client().request_unstake(&s.base.owner, &s.base.worker_id());
+
+        // advance past cooldown
+        s.set_time(2000 + 604_800 + 1);
+        s.base.client().unstake(&s.base.owner, &s.base.worker_id());
+
+        // owner gets back at least their stake
+        assert!(s.token_balance(&s.base.owner) >= 500_000);
+
+        let info = s.base.client().get_stake_info(&s.base.worker_id()).unwrap();
+        assert_eq!(info.amount, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cooldown not elapsed")]
+    fn test_unstake_before_cooldown_panics() {
+        let s = StakeTestEnv::new();
+        s.base.client().add_curator(&s.base.admin, &s.base.curator);
+        s.base.register_worker(&s.base.curator);
+
+        s.set_time(1000);
+        s.base.client().stake(&s.base.owner, &s.base.worker_id(), &s.token_addr, &100_000);
+        s.base.client().request_unstake(&s.base.owner, &s.base.worker_id());
+        s.base.client().unstake(&s.base.owner, &s.base.worker_id());
+    }
+
+    #[test]
+    #[should_panic(expected = "Unstake already requested")]
+    fn test_double_request_unstake_panics() {
+        let s = StakeTestEnv::new();
+        s.base.client().add_curator(&s.base.admin, &s.base.curator);
+        s.base.register_worker(&s.base.curator);
+
+        s.set_time(1000);
+        s.base.client().stake(&s.base.owner, &s.base.worker_id(), &s.token_addr, &100_000);
+        s.base.client().request_unstake(&s.base.owner, &s.base.worker_id());
+        s.base.client().request_unstake(&s.base.owner, &s.base.worker_id());
     }
 }

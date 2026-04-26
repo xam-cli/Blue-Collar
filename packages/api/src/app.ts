@@ -19,6 +19,7 @@ import responseTimeRoutes from './routes/response-time.js'
 import insuranceRoutes from './routes/insurance.js'
 import referralRoutes from './routes/referral.js'
 import { auditMiddleware } from './middleware/audit.js'
+import { versionMiddleware, deprecationWarning } from './middleware/version.js'
 
 const app = express()
 
@@ -31,6 +32,7 @@ app.use(express.urlencoded({ extended: true }))
 app.use(requestLogger)
 app.use(methodOverride('X-HTTP-Method'))
 app.use(passport.initialize())
+app.use(versionMiddleware)
 
 app.use(auditMiddleware)
 
